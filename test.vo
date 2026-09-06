@@ -1,0 +1,33 @@
+;;
+Complete Demo: Banking System
+;;
+
+VAR NUM Balance EAQ 1000          ; Balance -> A1
+VAR NUM Transaction EAQ 0         ; Transaction -> A2
+VAR TEX Status EAQ "Active"       ; Status -> B1
+VAR COLL History EAQ []           ; History -> B2
+VAR NUM Counter EAQ 0             ; Counter -> A3
+VAR DEC Result EAQ 0.0            ; Result -> C1
+
+AUTOCLEAN ON
+
+WHEN A1 CHANGED
+    History += NEW_VALUE
+    SHOW "Balance: $" + A1
+ENDWHEN
+
+WHEN A1 < 100
+    Status = "Low Balance"
+ENDWHEN
+
+IF Status == "Active"
+    SHOW "Account is " + Status
+ORIF Status == "Low Balance"
+    SHOW "Warning: " + Status
+IFNOT
+    SHOW "Alert: " + Status
+ENDIF
+
+Counter++
+A1--
+Result = 3.14 * (A1 + 5) ** 2

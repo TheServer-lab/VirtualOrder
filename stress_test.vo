@@ -1,0 +1,57 @@
+;;
+Parser stress test
+;;
+
+VAR NUM Balance EAQ 1000
+CONST NUM MaxRetries EAQ 3
+VAR TEX Status EAQ "Active"
+VAR COLL History EAQ [1, 2, 3]
+
+AUTOCLEAN ON
+
+Balance += 100
+A1--
+Counter++
+
+STORE Balance A2
+CLEAN A2
+CLEANALL
+
+Start:
+GOTO Start
+
+WHEN A1 CHANGED
+    SHOW "Balance changed to " + A1
+ENDWHEN
+
+WHEN A1 < 100
+    Status = "Low"
+ENDWHEN
+
+WHEN PROGRAM START
+    SHOW "boot"
+ENDWHEN
+
+IF Status == "Active"
+    SHOW "Account is " + Status
+ORIF Status == "Low"
+    SHOW "Warning: " + Status
+IFNOT
+    SHOW "Alert: " + Status
+ENDIF
+
+IFNOT Balance > 0
+    SHOW "non-positive balance"
+ENDIF
+
+WHILE Balance > 0
+    Balance--
+ENDWHILE
+
+FOR I = 0 TO LENGTH(History) - 1
+    SHOW History[I]
+ENDFOR
+
+Result = -2 ** 2
+Bits = (A1 & 1) | (A2 ^ A3)
+Flag = NOT Result > 0 AND Status == "Active"

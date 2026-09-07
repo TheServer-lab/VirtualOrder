@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo-wordmark.svg" alt="Virtual Order" width="600">
+  <img src="logo-wordmark.svg" alt="Virtual Order" width="600">
 </p>
 
 <p align="center">

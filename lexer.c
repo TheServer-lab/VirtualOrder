@@ -8,7 +8,7 @@
  * Anything alnum/underscore that is not in this table, and does not
  * match the VMA pattern below, is a plain IDENTIFIER.
  * ------------------------------------------------------------------- */
-typedef struct { const char *text; TokenType type; } Keyword;
+typedef struct { const char *text; VOTokenType type; } Keyword;
 
 static const Keyword KEYWORDS[] = {
     {"VAR",        TOKEN_VAR},
@@ -61,7 +61,7 @@ static const Keyword KEYWORDS[] = {
 };
 #define NUM_KEYWORDS (int)(sizeof(KEYWORDS) / sizeof(KEYWORDS[0]))
 
-const char *token_type_name(TokenType type) {
+const char *token_type_name(VOTokenType type) {
     switch (type) {
         case TOKEN_EOF: return "EOF";
         case TOKEN_ERROR: return "ERROR";
@@ -173,7 +173,7 @@ static int match(Lexer *lx, char expected) {
     return 1;
 }
 
-static Token make_token(Lexer *lx, TokenType type) {
+static Token make_token(Lexer *lx, VOTokenType type) {
     Token t;
     t.type   = type;
     t.start  = lx->start;

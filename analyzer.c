@@ -32,7 +32,7 @@ static void sem_warning(int line, const char *fmt, ...) {
  * ===================================================================== */
 typedef struct {
     char *name;
-    TokenType var_type;   /* TOKEN_TYPE_NUM / _DEC / _TEX / _YN / _COLL */
+    VOTokenType var_type;   /* TOKEN_TYPE_NUM / _DEC / _TEX / _YN / _COLL */
     int is_const;
     int is_loop_var;       /* implicit FOR iterator - no VMA of its own */
     char vma[16];           /* owned VMA address, e.g. "A1"; empty if loop var */
@@ -109,7 +109,7 @@ typedef struct {
     long index;
     char address[16];
     int allocated;
-    TokenType type;
+    VOTokenType type;
     char *owner;      /* identifier bound here, or NULL if raw-addressed */
 } VmaSlot;
 
@@ -186,7 +186,7 @@ static VmaSlot *vma_lookup(VmaTable *t, const char *addr) {
    are automatically preferred over addresses that have never been
    touched, because they always sort lower than the allocation
    frontier - no separate free-list bookkeeping needed. */
-static VmaSlot *vma_alloc_next(VmaTable *t, TokenType type, const char *owner) {
+static VmaSlot *vma_alloc_next(VmaTable *t, VOTokenType type, const char *owner) {
     long idx = 1;
     for (;;) {
         VmaSlot *existing = NULL;
@@ -206,7 +206,7 @@ static VmaSlot *vma_alloc_next(VmaTable *t, TokenType type, const char *owner) {
 /* Direct-address allocation, for the `VAR ... EAQ <VMA>` aliasing
    form. Returns NULL if that address is already allocated (aliasing
    ban, spec Sec 5) so the caller can report it. */
-static VmaSlot *vma_alloc_specific(VmaTable *t, const char *addr, TokenType type, const char *owner) {
+static VmaSlot *vma_alloc_specific(VmaTable *t, const char *addr, VOTokenType type, const char *owner) {
     long idx = vma_canonical_index(addr);
     VmaSlot *slot = vma_slot_for_index(t, idx);
     if (slot->allocated) return NULL;
@@ -450,7 +450,7 @@ static void analyze_expr(Analyzer *a, ASTNode *node) {
 static void analyze_var_decl(Analyzer *a, ASTNode *node) {
     int is_const = node->type == NODE_CONST_DECL;
     const char *name = node->as.var_decl.name;
-    TokenType var_type = node->as.var_decl.var_type;
+    VOTokenType var_type = node->as.var_decl.var_type;
     ASTNode *init = node->as.var_decl.init;
     int is_aliasing_form = init && init->type == NODE_VMA_REF;
 

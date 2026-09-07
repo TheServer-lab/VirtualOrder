@@ -696,7 +696,7 @@ static void rvma_set(VM *vm, const char *addr, Value new_val, int line) {
     value_free(&old_copy);
 }
 
-static Value binary_op(VM *vm, TokenType op, Value l, Value r, int line) {
+static Value binary_op(VM *vm, VOTokenType op, Value l, Value r, int line) {
     switch (op) {
         case TOKEN_PLUS:
             if (l.type == VAL_TEX || r.type == VAL_TEX) {
@@ -776,14 +776,14 @@ static Value binary_op(VM *vm, TokenType op, Value l, Value r, int line) {
     return value_null();
 }
 
-static Value apply_assign_op(VM *vm, TokenType op, Value current, Value rhs, int line) {
+static Value apply_assign_op(VM *vm, VOTokenType op, Value current, Value rhs, int line) {
     if (op == TOKEN_ASSIGN) return value_copy(rhs);
     if (current.type == VAL_COLL && op == TOKEN_PLUS_ASSIGN) {
         Value out = value_copy(current);
         value_coll_push(&out, value_copy(rhs));
         return out;
     }
-    TokenType base;
+    VOTokenType base;
     switch (op) {
         case TOKEN_PLUS_ASSIGN: base = TOKEN_PLUS; break;
         case TOKEN_MINUS_ASSIGN: base = TOKEN_MINUS; break;
@@ -924,7 +924,7 @@ static Value eval_expr(VM *vm, ASTNode *node) {
 /* =======================================================================
  * Statement execution
  * ===================================================================== */
-static Value default_value_for_type(TokenType t) {
+static Value default_value_for_type(VOTokenType t) {
     switch (t) {
         case TOKEN_TYPE_NUM: return value_num(0);
         case TOKEN_TYPE_DEC: return value_dec(0.0);
@@ -973,7 +973,7 @@ static void exec_clean(VM *vm, ASTNode *node) {
     if (!sym->is_loop_var && sym->vma[0]) rvma_free(&vm->vmas, sym->vma);
 }
 
-static void do_assign(VM *vm, ASTNode *target, TokenType op, Value rhs, int line) {
+static void do_assign(VM *vm, ASTNode *target, VOTokenType op, Value rhs, int line) {
     const char *addr = target_vma_addr(vm, target);
     if (addr) {
         RVmaSlot *slot = rvma_lookup(&vm->vmas, addr);
@@ -1002,7 +1002,7 @@ static void exec_simple_stmt(VM *vm, ASTNode *node) {
             break;
         }
         case NODE_INC_DEC_STMT: {
-            TokenType op = node->as.inc_dec.op == TOKEN_INCREMENT ? TOKEN_PLUS_ASSIGN : TOKEN_MINUS_ASSIGN;
+            VOTokenType op = node->as.inc_dec.op == TOKEN_INCREMENT ? TOKEN_PLUS_ASSIGN : TOKEN_MINUS_ASSIGN;
             do_assign(vm, node->as.inc_dec.target, op, value_num(1), node->line);
             break;
         }

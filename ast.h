@@ -74,9 +74,9 @@ struct ASTNode {
         struct { char *name; }               vma_ref;
         struct { char *name; }               identifier;
 
-        struct { TokenType op; ASTNode *operand; }                 unary;
-        struct { TokenType op; ASTNode *left; ASTNode *right; }    binary;
-        struct { TokenType op; ASTNode *target; ASTNode *value; }  assign;
+        struct { VOTokenType op; ASTNode *operand; }                 unary;
+        struct { VOTokenType op; ASTNode *left; ASTNode *right; }    binary;
+        struct { VOTokenType op; ASTNode *target; ASTNode *value; }  assign;
 
         struct { ASTNode *vma; }             load;          /* LOAD A1 */
         struct { ASTNode *arg; }             length_call;   /* LENGTH(expr) */
@@ -84,11 +84,11 @@ struct ASTNode {
         struct { ASTNode *array; ASTNode *index; } index_expr;
 
         /* declarations */
-        struct { TokenType var_type; char *name; ASTNode *init; } var_decl;
+        struct { VOTokenType var_type; char *name; ASTNode *init; } var_decl;
 
         /* statements */
         struct { ASTNode *expr; }            expr_stmt;
-        struct { ASTNode *target; TokenType op; } inc_dec;   /* op = INCREMENT/DECREMENT */
+        struct { ASTNode *target; VOTokenType op; } inc_dec;   /* op = INCREMENT/DECREMENT */
         struct { ASTNode *expr; }            show_stmt;
         struct { ASTNode *value; char *target_vma; } store_stmt;
         struct { char *target; }             clean_stmt;     /* identifier or VMA text */

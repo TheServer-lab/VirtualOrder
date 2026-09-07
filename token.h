@@ -84,16 +84,16 @@ typedef enum {
     TOKEN_COMMA, TOKEN_COLON,
     TOKEN_NEWLINE
 
-} TokenType;
+} VOTokenType;
 
 typedef struct {
-    TokenType   type;
+    VOTokenType type;
     const char *start;   /* pointer into source buffer, NOT null-terminated */
     int         length;
     int         line;
     int         col;
 } Token;
 
-const char *token_type_name(TokenType type);
+const char *token_type_name(VOTokenType type);
 
 #endif

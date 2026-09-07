@@ -30,15 +30,15 @@ static void advance(Parser *p) {
     }
 }
 
-static int check(Parser *p, TokenType type) { return p->current.type == type; }
+static int check(Parser *p, VOTokenType type) { return p->current.type == type; }
 
-static int match(Parser *p, TokenType type) {
+static int match(Parser *p, VOTokenType type) {
     if (!check(p, type)) return 0;
     advance(p);
     return 1;
 }
 
-static void expect(Parser *p, TokenType type, const char *msg) {
+static void expect(Parser *p, VOTokenType type, const char *msg) {
     if (check(p, type)) { advance(p); return; }
     error_at(p, p->current, msg);
 }
@@ -58,7 +58,7 @@ static void expect_statement_end(Parser *p) {
     skip_newlines(p);
 }
 
-static int is_assign_op(TokenType t) {
+static int is_assign_op(VOTokenType t) {
     return t == TOKEN_ASSIGN || t == TOKEN_PLUS_ASSIGN || t == TOKEN_MINUS_ASSIGN ||
            t == TOKEN_STAR_ASSIGN || t == TOKEN_SLASH_ASSIGN || t == TOKEN_PERCENT_ASSIGN;
 }
@@ -71,7 +71,7 @@ static int is_valid_assign_target(ASTNode *n) {
  * Forward declarations
  * ------------------------------------------------------------------- */
 static ASTNode *parse_expression(Parser *p);
-static ASTNode *parse_block_until(Parser *p, const TokenType *terminators, int n_terminators);
+static ASTNode *parse_block_until(Parser *p, const VOTokenType *terminators, int n_terminators);
 static ASTNode *parse_statement(Parser *p);
 static ASTNode *parse_conditional(Parser *p, int negate_condition);
 
@@ -108,7 +108,7 @@ static ASTNode *parse_conditional(Parser *p, int negate_condition);
  * swap the unary/power call order below.
  * ------------------------------------------------------------------- */
 
-static ASTNode *make_binary(TokenType op, ASTNode *left, ASTNode *right, int line) {
+static ASTNode *make_binary(VOTokenType op, ASTNode *left, ASTNode *right, int line) {
     ASTNode *n = ast_new(NODE_BINARY, line);
     n->as.binary.op = op;
     n->as.binary.left = left;
@@ -284,7 +284,7 @@ static ASTNode *parse_unary(Parser *p) {
 static ASTNode *parse_multiplicative(Parser *p) {
     ASTNode *left = parse_unary(p);
     while (check(p, TOKEN_STAR) || check(p, TOKEN_SLASH) || check(p, TOKEN_PERCENT)) {
-        TokenType op = p->current.type;
+        VOTokenType op = p->current.type;
         int line = p->current.line;
         advance(p);
         left = make_binary(op, left, parse_unary(p), line);
@@ -295,7 +295,7 @@ static ASTNode *parse_multiplicative(Parser *p) {
 static ASTNode *parse_additive(Parser *p) {
     ASTNode *left = parse_multiplicative(p);
     while (check(p, TOKEN_PLUS) || check(p, TOKEN_MINUS)) {
-        TokenType op = p->current.type;
+        VOTokenType op = p->current.type;
         int line = p->current.line;
         advance(p);
         left = make_binary(op, left, parse_multiplicative(p), line);
@@ -306,7 +306,7 @@ static ASTNode *parse_additive(Parser *p) {
 static ASTNode *parse_shift(Parser *p) {
     ASTNode *left = parse_additive(p);
     while (check(p, TOKEN_SHL) || check(p, TOKEN_SHR)) {
-        TokenType op = p->current.type;
+        VOTokenType op = p->current.type;
         int line = p->current.line;
         advance(p);
         left = make_binary(op, left, parse_additive(p), line);
@@ -348,7 +348,7 @@ static ASTNode *parse_comparison(Parser *p) {
     ASTNode *left = parse_bitor(p);
     while (check(p, TOKEN_EQEQ) || check(p, TOKEN_NEQ) || check(p, TOKEN_LT) ||
            check(p, TOKEN_GT)   || check(p, TOKEN_LE)  || check(p, TOKEN_GE)) {
-        TokenType op = p->current.type;
+        VOTokenType op = p->current.type;
         int line = p->current.line;
         advance(p);
         left = make_binary(op, left, parse_bitor(p), line);
@@ -402,7 +402,7 @@ static ASTNode *parse_or(Parser *p) {
 static ASTNode *parse_assignment(Parser *p) {
     ASTNode *left = parse_or(p);
     if (is_assign_op(p->current.type)) {
-        TokenType op = p->current.type;
+        VOTokenType op = p->current.type;
         int line = p->current.line;
         if (!is_valid_assign_target(left)) {
             error_at(p, p->current, "invalid assignment target");
@@ -426,7 +426,7 @@ static ASTNode *parse_expression(Parser *p) {
  * Statements
  * ------------------------------------------------------------------- */
 
-static int type_starts_var_decl(TokenType t) {
+static int type_starts_var_decl(VOTokenType t) {
     return t == TOKEN_TYPE_NUM || t == TOKEN_TYPE_DEC || t == TOKEN_TYPE_TEX ||
            t == TOKEN_TYPE_YN  || t == TOKEN_TYPE_COLL;
 }
@@ -438,7 +438,7 @@ static ASTNode *parse_var_or_const_decl(Parser *p, int is_const) {
     if (!type_starts_var_decl(p->current.type)) {
         error_at(p, p->current, "expected a type (NUM/DEC/TEX/YN/COLL)");
     }
-    TokenType var_type = p->current.type;
+    VOTokenType var_type = p->current.type;
     advance(p);
 
     Token name_tok = p->current;
@@ -466,7 +466,7 @@ static ASTNode *parse_assignment_or_incdec_statement(Parser *p) {
     int line = p->current.line;
 
     if (check(p, TOKEN_INCREMENT) || check(p, TOKEN_DECREMENT)) {
-        TokenType op = p->current.type;
+        VOTokenType op = p->current.type;
         advance(p);
         if (!is_valid_assign_target(target)) {
             error_at(p, p->current, "invalid target for ++/--");
@@ -479,7 +479,7 @@ static ASTNode *parse_assignment_or_incdec_statement(Parser *p) {
     }
 
     if (is_assign_op(p->current.type)) {
-        TokenType op = p->current.type;
+        VOTokenType op = p->current.type;
         advance(p);
         if (!is_valid_assign_target(target)) {
             error_at(p, p->current, "invalid assignment target");
@@ -583,7 +583,7 @@ static ASTNode *parse_label_stmt(Parser *p) {
     return n;
 }
 
-static ASTNode *parse_if_branch(Parser *p, ASTNode *condition, const TokenType *terms, int n_terms) {
+static ASTNode *parse_if_branch(Parser *p, ASTNode *condition, const VOTokenType *terms, int n_terms) {
     int line = p->current.line;
     ASTNode *block = parse_block_until(p, terms, n_terms);
     ASTNode *branch = ast_new(NODE_IF_BRANCH, line);
@@ -612,7 +612,7 @@ static ASTNode *parse_conditional(Parser *p, int negate_condition) {
     ASTNode *if_stmt = ast_new(NODE_IF_STMT, line);
     nodelist_init(&if_stmt->as.if_stmt.branches);
 
-    TokenType terms[] = { TOKEN_ORIF, TOKEN_IFNOT, TOKEN_ENDIF };
+    VOTokenType terms[] = { TOKEN_ORIF, TOKEN_IFNOT, TOKEN_ENDIF };
     nodelist_push(&if_stmt->as.if_stmt.branches,
                   parse_if_branch(p, condition, terms, 3));
 
@@ -641,7 +641,7 @@ static ASTNode *parse_conditional(Parser *p, int negate_condition) {
             cond->as.unary.operand = raw;
         }
         expect_statement_end(p);
-        TokenType only_endif[] = { TOKEN_ENDIF };
+        VOTokenType only_endif[] = { TOKEN_ENDIF };
         ASTNode *block = parse_block_until(p, only_endif, 1);
         ASTNode *branch = ast_new(NODE_IF_BRANCH, bline);
         branch->as.if_branch.condition = cond; /* NULL => plain else */
@@ -659,7 +659,7 @@ static ASTNode *parse_while_stmt(Parser *p) {
     advance(p); /* WHILE */
     ASTNode *condition = parse_expression(p);
     expect_statement_end(p);
-    TokenType terms[] = { TOKEN_ENDWHILE };
+    VOTokenType terms[] = { TOKEN_ENDWHILE };
     ASTNode *block = parse_block_until(p, terms, 1);
     expect(p, TOKEN_ENDWHILE, "expected ENDWHILE");
     expect_statement_end(p);
@@ -680,7 +680,7 @@ static ASTNode *parse_for_stmt(Parser *p) {
     expect(p, TOKEN_TO, "expected TO in FOR loop range");
     ASTNode *end = parse_expression(p);
     expect_statement_end(p);
-    TokenType terms[] = { TOKEN_ENDFOR };
+    VOTokenType terms[] = { TOKEN_ENDFOR };
     ASTNode *block = parse_block_until(p, terms, 1);
     expect(p, TOKEN_ENDFOR, "expected ENDFOR");
     expect_statement_end(p);
@@ -715,7 +715,7 @@ static ASTNode *parse_when_stmt(Parser *p) {
     }
 
     expect_statement_end(p);
-    TokenType terms[] = { TOKEN_ENDWHEN };
+    VOTokenType terms[] = { TOKEN_ENDWHEN };
     n->as.when_stmt.block = parse_block_until(p, terms, 1);
     expect(p, TOKEN_ENDWHEN, "expected ENDWHEN");
     expect_statement_end(p);
@@ -764,7 +764,7 @@ static ASTNode *parse_statement(Parser *p) {
 
 /* Parses statements until one of the given terminator token types is
    seen (without consuming it), returning them wrapped in a NODE_BLOCK. */
-static ASTNode *parse_block_until(Parser *p, const TokenType *terminators, int n_terminators) {
+static ASTNode *parse_block_until(Parser *p, const VOTokenType *terminators, int n_terminators) {
     ASTNode *block = ast_new(NODE_BLOCK, p->current.line);
     nodelist_init(&block->as.block.statements);
     skip_newlines(p);

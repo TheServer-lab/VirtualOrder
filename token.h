@@ -7,15 +7,23 @@ typedef enum {
     TOKEN_ERROR,
 
     /* Literals & identifiers */
-    TOKEN_NUM_LITERAL,      /* 45, 1000            */
-    TOKEN_DEC_LITERAL,      /* 3.14                */
-    TOKEN_TEX_LITERAL,      /* "hello"             */
-    TOKEN_VMA,              /* A1, AA3, ZZZZAAER1000 -> [A-Z]+[0-9]+ */
-    TOKEN_IDENTIFIER,       /* Age, Balance, isActive */
+    TOKEN_NUM_LITERAL,
+    TOKEN_DEC_LITERAL,
+    TOKEN_TEX_LITERAL,
+    TOKEN_VMA,
+    TOKEN_IDENTIFIER,
 
-    /* Declaration / memory keywords */
+    /* Type keywords */
+    TOKEN_TYPE_NUM,
+    TOKEN_TYPE_DEC,
+    TOKEN_TYPE_TEX,
+    TOKEN_TYPE_YN,
+    TOKEN_TYPE_COLL,
+    TOKEN_TYPE_EMP,
+
+    /* Declaration keywords */
     TOKEN_VAR,
-    TOKEN_CONST,
+    TOKEN_HARD,
     TOKEN_EAQ,
     TOKEN_STORE,
     TOKEN_LOAD,
@@ -53,20 +61,32 @@ typedef enum {
     TOKEN_OR,
     TOKEN_XOR,
 
-    /* Type keywords */
-    TOKEN_TYPE_NUM,
-    TOKEN_TYPE_DEC,
-    TOKEN_TYPE_TEX,
-    TOKEN_TYPE_YN,
-    TOKEN_TYPE_COLL,
-
-    /* Boolean / null literals */
+    /* Boolean / empty literals */
     TOKEN_YES,
     TOKEN_NO,
-    TOKEN_NULL,
+    TOKEN_EMP,
 
     /* Builtins */
     TOKEN_LENGTH,
+
+    /* Functions */
+    TOKEN_JOB,
+    TOKEN_ENDJOB,
+    TOKEN_GIVE,
+
+    /* Modules */
+    TOKEN_PEICE,
+    TOKEN_ENDPEICE,
+    TOKEN_BRING,
+    TOKEN_SHIP,
+
+    /* Error handling */
+    TOKEN_DEMAND,
+    TOKEN_DO,
+    TOKEN_GRABE,
+    TOKEN_ENDDO,
+    TOKEN_SERVE,
+    TOKEN_ISSUE,
 
     /* Operators */
     TOKEN_PLUS, TOKEN_MINUS, TOKEN_STAR, TOKEN_SLASH, TOKEN_PERCENT, TOKEN_POWER,
@@ -82,6 +102,7 @@ typedef enum {
     TOKEN_LPAREN, TOKEN_RPAREN,
     TOKEN_LBRACKET, TOKEN_RBRACKET,
     TOKEN_COMMA, TOKEN_COLON,
+    TOKEN_DOT,
     TOKEN_NEWLINE
 
 } VOTokenType;

@@ -16,7 +16,7 @@
  * ========================================================================= */
 #include <stddef.h>
 
-typedef enum { VO_NUM, VO_DEC, VO_TEX, VO_YN, VO_COLL, VO_NULL } VoType;
+typedef enum { VO_NUM, VO_DEC, VO_TEX, VO_YN, VO_COLL, VO_NULL, VO_EMP } VoType;
 
 typedef struct VoValue {
     VoType type;
@@ -34,6 +34,7 @@ void vo_set_dec(VoValue *v, double d);
 void vo_set_tex(VoValue *v, const char *s);
 void vo_set_yn(VoValue *v, int b);
 void vo_set_null(VoValue *v);
+void vo_set_emp(VoValue *v);
 void vo_set_dec_from_ptr(VoValue *v, const double *d); /* codegen passes double constants by address */
 void vo_coll_new(VoValue *v);
 void vo_copy(VoValue *dst, const VoValue *src);   /* deep copy, dst overwritten (not freed first) */
@@ -80,6 +81,12 @@ void vo_show(VoValue *v);
 
 /* ---- assign-op helper (mirrors spec: COLL += appends) ---- */
 void vo_plus_assign(VoValue *dst, VoValue *current, VoValue *rhs, int line);
+
+/* ---- v1.3 control-flow helpers ---- */
+/* vo_demand: if cond is not truthy (and message, if provided, is
+   non-NULL), raise a fatal runtime error. Returns the truthiness so
+   codegen can branch (used for DEMAND inside a DO block). */
+int  vo_demand_check(VoValue *cond, int line);
 
 /* ---- fatal runtime error: prints "[line N] Runtime error: msg" to
    stderr and exits with status 1, matching the tree-walking runtime ---- */

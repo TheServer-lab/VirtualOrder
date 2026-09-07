@@ -7,26 +7,28 @@
 #include <math.h>
 #include <setjmp.h>
 #include "runtime.h"
+#include "parser.h"
+#include "ast.h"
 
 /* =======================================================================
  * Values
  * ===================================================================== */
-typedef enum { VAL_NUM, VAL_DEC, VAL_TEX, VAL_YN, VAL_COLL, VAL_NULL } ValType;
+typedef enum { VAL_NUM, VAL_DEC, VAL_TEX, VAL_YN, VAL_COLL, VAL_EMP } ValType;
 
 typedef struct Value {
     ValType type;
     long num;
     double dec;
-    char *tex;                 /* owned */
+    char *tex;
     int yn;
-    struct Value *items;       /* owned, for VAL_COLL */
+    struct Value *items;
     int count, capacity;
 } Value;
 
 static Value value_num(long n)  { Value v = {0}; v.type = VAL_NUM; v.num = n; return v; }
 static Value value_dec(double d){ Value v = {0}; v.type = VAL_DEC; v.dec = d; return v; }
 static Value value_yn(int b)    { Value v = {0}; v.type = VAL_YN; v.yn = b ? 1 : 0; return v; }
-static Value value_null(void)   { Value v = {0}; v.type = VAL_NULL; return v; }
+static Value value_emp(void)    { Value v = {0}; v.type = VAL_EMP; return v; }
 static Value value_tex(const char *s) { Value v = {0}; v.type = VAL_TEX; v.tex = strdup(s ? s : ""); return v; }
 static Value value_coll_empty(void) { Value v = {0}; v.type = VAL_COLL; return v; }
 
@@ -59,9 +61,6 @@ static void value_coll_push(Value *coll, Value item) {
     coll->items[coll->count++] = item;
 }
 
-/* Text rendering used both for SHOW and for '+' string concatenation -
-   Virtual Order concatenation auto-stringifies the non-TEX side (spec
-   Sec 9 example: `"Balance: $" + A1`), with no surrounding quotes. */
 static char *value_to_cstr(Value v) {
     char buf[64];
     switch (v.type) {
@@ -69,7 +68,7 @@ static char *value_to_cstr(Value v) {
         case VAL_DEC: snprintf(buf, sizeof(buf), "%g", v.dec); return strdup(buf);
         case VAL_TEX: return strdup(v.tex ? v.tex : "");
         case VAL_YN:  return strdup(v.yn ? "YES" : "NO");
-        case VAL_NULL: return strdup("NULL");
+        case VAL_EMP: return strdup("EMP");
         case VAL_COLL: {
             size_t cap = 64, len = 0;
             char *out = malloc(cap);
@@ -95,7 +94,6 @@ static char *value_to_cstr(Value v) {
     return strdup("");
 }
 
-/* Boolean conversion table, spec Sec 4. */
 static int value_to_bool(Value v) {
     switch (v.type) {
         case VAL_NUM: return v.num != 0;
@@ -103,7 +101,7 @@ static int value_to_bool(Value v) {
         case VAL_TEX: return v.tex && v.tex[0] != '\0';
         case VAL_YN:  return v.yn != 0;
         case VAL_COLL: return v.count != 0;
-        case VAL_NULL: return 0;
+        case VAL_EMP: return 0;
     }
     return 0;
 }
@@ -112,16 +110,13 @@ static double value_as_double(Value v) { return v.type == VAL_DEC ? v.dec : (dou
 static long    value_as_long(Value v)  { return v.type == VAL_DEC ? (long)v.dec : v.num; }
 static int     value_is_numeric(Value v) { return v.type == VAL_NUM || v.type == VAL_DEC; }
 
-/* Equality: numeric types compare across NUM/DEC by value; everything
-   else must match type exactly. Used for `CHANGED` (spec Sec 6.E: new
-   value != old value) and `==`/`!=`. */
 static int value_equal(Value a, Value b) {
     if (value_is_numeric(a) && value_is_numeric(b)) return value_as_double(a) == value_as_double(b);
     if (a.type != b.type) return 0;
     switch (a.type) {
         case VAL_TEX: return strcmp(a.tex ? a.tex : "", b.tex ? b.tex : "") == 0;
         case VAL_YN:  return a.yn == b.yn;
-        case VAL_NULL: return 1;
+        case VAL_EMP: return 1;
         case VAL_COLL:
             if (a.count != b.count) return 0;
             for (int i = 0; i < a.count; i++) if (!value_equal(a.items[i], b.items[i])) return 0;
@@ -137,16 +132,14 @@ typedef struct VM VM;
 static void runtime_error(VM *vm, int line, const char *fmt, ...);
 
 /* =======================================================================
- * Scoped symbol table (mirrors analyzer.c's model, plus real storage:
- * a symbol is either bound to a VMA, or - for FOR loop iterators only,
- * per spec Sec 6.D's "no VMA of its own" - holds its value directly.)
+ * Scoped symbol table
  * ===================================================================== */
 typedef struct {
     char *name;
     int is_const;
     int is_loop_var;
     char vma[16];
-    Value direct_value;   /* valid only if is_loop_var */
+    Value direct_value;
     int autocleans;
 } Symbol;
 
@@ -197,8 +190,7 @@ static void scope_pop_last(Scope *s) {
 }
 
 /* =======================================================================
- * VMA table - same addressing/allocation model as analyzer.c (Sec
- * 6.A/6.B), extended to hold a real Value per slot.
+ * VMA table
  * ===================================================================== */
 #define VMA_NUMBERS_PER_LETTER 9999
 
@@ -263,7 +255,7 @@ static RVmaSlot *rvma_slot_for_index(RVmaTable *t, long idx) {
     RVmaSlot *slot = &t->slots[t->count++];
     memset(slot, 0, sizeof(RVmaSlot));
     slot->index = idx;
-    slot->value = value_null();
+    slot->value = value_emp();
     index_to_vma(idx, slot->address);
     return slot;
 }
@@ -291,22 +283,12 @@ static RVmaSlot *rvma_alloc_next(RVmaTable *t, const char *owner) {
     return slot;
 }
 
-static RVmaSlot *rvma_alloc_specific(RVmaTable *t, const char *addr, const char *owner) {
-    long idx = vma_canonical_index(addr);
-    RVmaSlot *slot = rvma_slot_for_index(t, idx);
-    if (slot->allocated) return NULL;
-    slot->allocated = 1;
-    free(slot->owner);
-    slot->owner = owner ? strdup(owner) : NULL;
-    return slot;
-}
-
 static void rvma_free(RVmaTable *t, const char *addr) {
     RVmaSlot *slot = rvma_lookup(t, addr);
     if (!slot) return;
     slot->allocated = 0;
     value_free(&slot->value);
-    slot->value = value_null();
+    slot->value = value_emp();
     free(slot->owner);
     slot->owner = NULL;
 }
@@ -315,62 +297,79 @@ static void rvma_free_all(RVmaTable *t) {
     for (int i = 0; i < t->count; i++) {
         t->slots[i].allocated = 0;
         value_free(&t->slots[i].value);
-        t->slots[i].value = value_null();
+        t->slots[i].value = value_emp();
         free(t->slots[i].owner);
         t->slots[i].owner = NULL;
     }
 }
 
 /* =======================================================================
- * WHEN handlers + FIFO event queue (spec Sec 6.E)
+ * Module system
+ * ===================================================================== */
+typedef enum { MOD_MEMBER_JOB, MOD_MEMBER_VAR } ModMemberKind;
+
+typedef struct {
+    char *name;                /* exported name (e.g., "ADD") */
+    ModMemberKind kind;        /* job or variable */
+    char *job_internal;        /* for jobs: internal job name (e.g., "math#ADD") */
+    RVmaSlot *slot;            /* for vars: pointer to VMA slot */
+    int is_exported;           /* SHIPped? */
+} ModMember;
+
+typedef struct {
+    char *name;                /* module name (e.g., "math") */
+    ModMember *members; int member_count, member_cap;
+    int loaded;                /* 1 if fully loaded */
+    int loading;               /* 1 if currently being loaded (for cycle detection) */
+    ASTNode *peice_ast;        /* the PEICE_DECL node for this module (for compilation) */
+    Scope *persistent_scope;   /* scope for SHIPped variables, persists after init */
+} Module;
+
+/* =======================================================================
+ * Job registry
+ * ===================================================================== */
+typedef struct {
+    char *name;
+    int body_start;
+    int param_count;
+    struct { char *name; VOTokenType var_type; } *params;
+} JobEntry;
+
+/* =======================================================================
+ * WHEN handlers + FIFO event queue
  * ===================================================================== */
 typedef struct {
     WhenKind kind;
-    char vma_addr[16];     /* WHEN_VMA_CHANGED */
-    ASTNode *condition;    /* WHEN_CONDITION   */
-    int last_state;        /* edge-trigger state, WHEN_CONDITION only  */
-    int body_start;        /* resolved instruction index of the body   */
+    char vma_addr[16];
+    ASTNode *condition;
+    int last_state;
+    int body_start;
 } Handler;
 
 typedef struct {
     int handler_index;
     int has_values;
-    Value old_value, new_value;   /* only meaningful for CHANGED events */
+    Value old_value, new_value;
 } QueueEntry;
 
 #define DEFAULT_MAX_QUEUE_DEPTH 1000
 
 /* =======================================================================
- * Flattened, jump-based instruction stream.
- *
- * Design note: GOTO in Virtual Order is unstructured, assembly-style,
- * with a single flat whole-program label namespace and forward
- * references allowed. A tree-walking interpreter has no single
- * "instruction pointer" that a GOTO could redirect across nested
- * IF/WHILE/FOR/WHEN bodies, so instead the whole program is compiled
- * once, up front, into one flat array of jump-based instructions (a
- * tiny bytecode) - exactly the "flattened or indexable AST" GOTO
- * needs. IF/WHILE/FOR compile to conditional/unconditional jumps the
- * usual way; a WHEN block other than `WHEN PROGRAM START` compiles its
- * body inline too (so GOTO/labels inside it share the same global
- * index space) but guarded by a jump that skips over it in normal
- * top-to-bottom flow - the body only runs when the event queue
- * dispatches it (see run_range below). `WHEN PROGRAM START` has no
- * such guard: it runs in place, in program order, acting as the
- * language's de facto entry point.
- * ------------------------------------------------------------------- */
+ * Flattened, jump-based instruction stream
+ * ===================================================================== */
 typedef enum {
     I_STMT, I_JUMP, I_JUMP_IF_FALSE,
     I_FOR_SETUP, I_FOR_TEST, I_FOR_STEP, I_FOR_TEARDOWN,
     I_SCOPE_PUSH, I_SCOPE_POP,
-    I_WHEN_REGISTER, I_HANDLER_RETURN
+    I_WHEN_REGISTER, I_HANDLER_RETURN,
+    I_GIVE
 } InstrKind;
 
 typedef struct {
     InstrKind kind;
-    ASTNode *node;   /* statement / condition-owner / for / when node, as relevant */
-    int target;      /* resolved jump target instruction index */
-    int target2;     /* I_WHEN_REGISTER: resolved body-start index */
+    ASTNode *node;
+    int target;
+    int target2;
 } Instr;
 
 typedef struct { Instr *items; int count, capacity; } InstrList;
@@ -382,7 +381,9 @@ typedef struct {
     InstrList instrs;
     LabelEntry *labels; int label_count, label_cap;
     PendingGoto *pending; int pending_count, pending_cap;
+    JobEntry *jobs; int job_count, job_cap;
     int had_error;
+    const char *module_prefix;   /* prefix for job names when inside a module (e.g., "math#") */
 } Compiler;
 
 static int emit(Compiler *c, InstrKind kind, ASTNode *node) {
@@ -424,17 +425,56 @@ static void pending_goto_add(Compiler *c, int instr_index, const char *label, in
     c->pending_count++;
 }
 
+static void job_register(Compiler *c, const char *name, int body_start, JobParam *params, int param_count) {
+    if (c->job_count == c->job_cap) {
+        c->job_cap = c->job_cap ? c->job_cap * 2 : 8;
+        c->jobs = realloc(c->jobs, sizeof(JobEntry) * c->job_cap);
+    }
+    JobEntry *j = &c->jobs[c->job_count++];
+    /* Apply module prefix if inside a module */
+    if (c->module_prefix) {
+        char prefixed[128];
+        snprintf(prefixed, sizeof(prefixed), "%s%s", c->module_prefix, name);
+        j->name = strdup(prefixed);
+    } else {
+        j->name = strdup(name);
+    }
+j->body_start = body_start;
+    j->param_count = param_count;
+    j->params = param_count ? malloc(sizeof(*j->params) * param_count) : NULL;
+    for (int i = 0; i < param_count; i++) {
+        j->params[i].name = strdup(params[i].name);
+        j->params[i].var_type = params[i].var_type;
+    }
+}
+
 static void compile_block(Compiler *c, ASTNode *block);
+
+/* Module system forward declarations */
+static Module *module_find(VM *vm, const char *name);
+static Module *module_ensure(VM *vm, const char *name);
+static ModMember *module_member_find(Module *mod, const char *name);
+static ModMember *module_member_add(Module *mod, const char *name, ModMemberKind kind);
+static int module_load(VM *vm, const char *path, const char *base_dir);
+static void module_compile_all(Compiler *c, VM *vm);
+static void module_finalize_jobs(VM *vm, Module *mod);
+static int module_initialize(VM *vm, Module *mod);
+static void exec_simple_stmt(VM *vm, ASTNode *node);
 
 static void compile_stmt(Compiler *c, ASTNode *node) {
     if (!node) return;
     switch (node->type) {
-        case NODE_VAR_DECL: case NODE_CONST_DECL:
+        case NODE_VAR_DECL: case NODE_HARD_DECL:
         case NODE_EXPR_STMT: case NODE_INC_DEC_STMT:
         case NODE_SHOW_STMT: case NODE_STORE_STMT:
         case NODE_CLEAN_STMT: case NODE_CLEANALL_STMT:
         case NODE_AUTOCLEAN_STMT:
+        case NODE_DEMAND_STMT: case NODE_SERVE_STMT:
             emit(c, I_STMT, node);
+            break;
+
+        case NODE_GIVE_STMT:
+            emit(c, I_GIVE, node);
             break;
 
         case NODE_LABEL_STMT:
@@ -512,6 +552,39 @@ static void compile_stmt(Compiler *c, ASTNode *node) {
             break;
         }
 
+        case NODE_JOB_DECL: {
+            /* Skip over job body in normal execution flow */
+            int skip = emit(c, I_JUMP, NULL);
+            int body_start = c->instrs.count;
+            /* Job body: compile statements, end with I_HANDLER_RETURN */
+            compile_block(c, node->as.job_decl.body);
+            emit(c, I_HANDLER_RETURN, NULL);
+            patch(c, skip, c->instrs.count);
+            /* Register the job */
+            job_register(c, node->as.job_decl.name, body_start,
+                         node->as.job_decl.params, node->as.job_decl.param_count);
+            break;
+        }
+
+        case NODE_DO_STMT: {
+            /* DO/GRABE: compile try block, then catch block.
+               SERVE inside the try block will longjmp to the catch block.
+               For the instruction stream, we compile both blocks inline.
+               The try block is guarded by a setjmp; if SERVE fires inside,
+               it longjmps to the catch block start. We represent this
+               as: compile try block normally, then compile catch block.
+               The runtime handles the actual catch via do_depth/do_catch_pc. */
+            emit(c, I_STMT, node);  /* handled in exec_simple_stmt */
+            break;
+        }
+
+        case NODE_BRING_STMT:
+        case NODE_SHIP_STMT:
+        case NODE_PEICE_DECL:
+            /* Module system - handled at runtime as stubs */
+            emit(c, I_STMT, node);
+            break;
+
         case NODE_BLOCK:
             compile_block(c, node);
             break;
@@ -527,9 +600,33 @@ static void compile_block(Compiler *c, ASTNode *block) {
         compile_stmt(c, block->as.block.statements.items[i]);
 }
 
-static void compile_program(Compiler *c, ASTNode *program, InstrList *out) {
+static void compile_program(Compiler *c, VM *vm, ASTNode *program, const char *source_dir, InstrList *out) {
     memset(c, 0, sizeof(*c));
+    memset(out, 0, sizeof(*out)); /* always leave *out in a free()-able state, even on early return below */
+
+    /* ---- Module loading pass ----
+       Walk top-level statements to find BRINGs and load modules.
+       The root node from parser_parse_program() is NODE_PROGRAM (nested
+       blocks are NODE_BLOCK) - both share the same `as.block.statements`
+       layout, so accept either here. */
+    if (program->type == NODE_BLOCK || program->type == NODE_PROGRAM) {
+        for (int i = 0; i < program->as.block.statements.count; i++) {
+            ASTNode *stmt = program->as.block.statements.items[i];
+            if (stmt && stmt->type == NODE_BRING_STMT) {
+                if (module_load(vm, stmt->as.bring_stmt.path, source_dir)) {
+                    c->had_error = 1;
+                    return;
+                }
+            }
+        }
+    }
+
+    /* ---- Compile each loaded module's PEICE body ---- */
+    module_compile_all(c, vm);
+
+    /* ---- Compile main program body ---- */
     compile_block(c, program);
+
     for (int i = 0; i < c->pending_count; i++) {
         int target = -1;
         for (int j = 0; j < c->label_count; j++)
@@ -562,6 +659,24 @@ struct VM {
     Instr *code;
     int code_count;
 
+    JobEntry *jobs;
+    int job_count;
+
+    /* Module system */
+    Module *modules; int module_count, module_cap;
+    int active_module;         /* index of module whose job is currently running (-1 = main) */
+    int initializing_module;   /* module currently being initialized (-1 = none) */
+    char *source_dir;          /* directory of the main source file for BRING resolution */
+
+    /* GIVE mechanism */
+    Value give_value;
+    int giving;
+
+    /* DO/GRABE mechanism */
+    int do_depth;
+    int do_catch_pc;
+    jmp_buf do_catch_buf;
+
     long for_end_stack[256];
     int for_end_top;
 
@@ -570,7 +685,281 @@ struct VM {
     jmp_buf abort_buf;
 };
 
-static void runtime_error(VM *vm, int line, const char *fmt, ...) {
+/* =======================================================================
+ * Module system helpers
+ * ===================================================================== */
+
+static Module *module_find(VM *vm, const char *name) {
+    for (int i = 0; i < vm->module_count; i++)
+        if (strcmp(vm->modules[i].name, name) == 0)
+            return &vm->modules[i];
+    return NULL;
+}
+
+static Module *module_ensure(VM *vm, const char *name) {
+    Module *m = module_find(vm, name);
+    if (m) return m;
+    if (vm->module_count == vm->module_cap) {
+        vm->module_cap = vm->module_cap ? vm->module_cap * 2 : 8;
+        vm->modules = realloc(vm->modules, sizeof(Module) * vm->module_cap);
+    }
+    Module *nm = &vm->modules[vm->module_count++];
+    memset(nm, 0, sizeof(Module));
+    nm->name = strdup(name);
+    return nm;
+}
+
+static ModMember *module_member_find(Module *mod, const char *name) {
+    for (int i = 0; i < mod->member_count; i++)
+        if (strcmp(mod->members[i].name, name) == 0)
+            return &mod->members[i];
+    return NULL;
+}
+
+static ModMember *module_member_add(Module *mod, const char *name, ModMemberKind kind) {
+    if (mod->member_count == mod->member_cap) {
+        mod->member_cap = mod->member_cap ? mod->member_cap * 2 : 8;
+        mod->members = realloc(mod->members, sizeof(ModMember) * mod->member_cap);
+    }
+    ModMember *mm = &mod->members[mod->member_count++];
+    memset(mm, 0, sizeof(ModMember));
+    mm->name = strdup(name);
+    mm->kind = kind;
+    return mm;
+}
+
+/* Load a module from a .vo file at the given path, relative to base_dir.
+   Returns 0 on success, 1 on error (error reported via runtime_error). */
+static int module_load(VM *vm, const char *path, const char *base_dir) {
+    /* Resolve full path */
+    char full_path[4096];
+    if (path[0] == '/' || (path[0] && path[1] == ':')) {
+        snprintf(full_path, sizeof(full_path), "%s", path);
+    } else {
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, path);
+    }
+
+    /* Read file */
+    FILE *f = fopen(full_path, "rb");
+    if (!f) {
+        runtime_error(vm, 0, "module file not found: %s", full_path);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *source = malloc(size + 1);
+    if (fread(source, 1, size, f) != (size_t)size) { free(source); fclose(f); runtime_error(vm, 0, "failed to read module: %s", full_path); return 1; }
+    source[size] = '\0';
+    fclose(f);
+
+    /* Parse */
+    Parser parser;
+    parser_init(&parser, source);
+    ASTNode *prog = parser_parse_program(&parser);
+    if (parser.had_error) {
+        free(source);
+        runtime_error(vm, 0, "module parse errors");
+        return 1;
+    }
+
+    /* Verify top-level is a single PEICE_DECL. parser_parse_program() wraps
+       a whole file's statements in NODE_PROGRAM (not NODE_BLOCK) - both
+       use the same `as.block.statements` layout, so accept either. */
+    if ((prog->type != NODE_BLOCK && prog->type != NODE_PROGRAM) ||
+        prog->as.block.statements.count != 1 ||
+        prog->as.block.statements.items[0]->type != NODE_PEICE_DECL) {
+        free(source);
+        ast_free(prog);
+        runtime_error(vm, 0, "module must contain exactly one PEICE declaration");
+        return 1;
+    }
+    ASTNode *peice = prog->as.block.statements.items[0];
+    const char *peice_name = peice->as.peice_decl.name;
+
+    /* Check module already loaded */
+    Module *mod = module_find(vm, peice_name);
+    if (mod) {
+        if (mod->loading) {
+            free(source);
+            ast_free(prog);
+            runtime_error(vm, 0, "circular module dependency: %s", peice_name);
+            return 1;
+        }
+        if (mod->loaded) {
+            free(source);
+            ast_free(prog);
+            return 0; /* already loaded */
+        }
+    } else {
+        mod = module_ensure(vm, peice_name);
+    }
+    mod->loading = 1;
+    mod->peice_ast = peice;  /* store for later compilation */
+
+    /* Recursively load nested BRINGs in the PEICE body */
+    ASTNode *body = peice->as.peice_decl.body;
+    for (int i = 0; i < body->as.block.statements.count; i++) {
+        ASTNode *stmt = body->as.block.statements.items[i];
+        if (stmt->type == NODE_BRING_STMT) {
+            const char *mod_dir = full_path;
+            char *slash = strrchr(full_path, '/');
+            if (slash) {
+                mod_dir = full_path;
+                *slash = '\0';
+                if (module_load(vm, stmt->as.bring_stmt.path, mod_dir)) {
+                    *slash = '/';
+                    mod->loading = 0;
+                    free(source);
+                    ast_free(prog);
+                    return 1;
+                }
+                *slash = '/';
+            } else {
+                if (module_load(vm, stmt->as.bring_stmt.path, base_dir)) {
+                    mod->loading = 0;
+                    free(source);
+                    ast_free(prog);
+                    return 1;
+                }
+            }
+        }
+    }
+
+    /* Collect SHIPped members from the PEICE */
+    for (int i = 0; i < body->as.block.statements.count; i++) {
+        ASTNode *stmt = body->as.block.statements.items[i];
+        if (stmt->type == NODE_SHIP_STMT) {
+            const char *ship_name = stmt->as.ship_stmt.name;
+            /* Check if it's a job or variable declaration */
+            int is_job = 0;
+            for (int j = 0; j < body->as.block.statements.count; j++) {
+                ASTNode *other = body->as.block.statements.items[j];
+                if (other->type == NODE_JOB_DECL && strcmp(other->as.job_decl.name, ship_name) == 0) {
+                    is_job = 1;
+                    break;
+                }
+                if ((other->type == NODE_VAR_DECL || other->type == NODE_HARD_DECL) &&
+                    strcmp(other->as.var_decl.name, ship_name) == 0) {
+                    is_job = 0;
+                    break;
+                }
+            }
+            ModMemberKind kind = is_job ? MOD_MEMBER_JOB : MOD_MEMBER_VAR;
+            ModMember *mm = module_member_add(mod, ship_name, kind);
+            mm->is_exported = 1;
+        }
+    }
+
+    mod->loaded = 1;
+    mod->loading = 0;
+    free(source);
+    /* Do NOT ast_free(prog) - we need the PEICE AST for compilation later */
+    return 0;
+}
+
+static void module_compile_all(Compiler *c, VM *vm) {
+    for (int m = 0; m < vm->module_count; m++) {
+        Module *mod = &vm->modules[m];
+        if (!mod->loaded) continue;
+        char prefix[64];
+        snprintf(prefix, sizeof(prefix), "%s#", mod->name);
+        const char *saved_prefix = c->module_prefix;
+        c->module_prefix = prefix;
+        
+        /* Only compile JOB_DECL statements from the module body.
+           Top-level statements (HARD, VAR, SHIP) are executed during module_initialize. */
+        ASTNode *body = mod->peice_ast->as.peice_decl.body;
+        if (body && body->type == NODE_BLOCK) {
+            /* Create a temporary block with only JOB_DECL statements */
+            ASTNode *job_block = ast_new(NODE_BLOCK, 0);
+            nodelist_init(&job_block->as.block.statements);
+            for (int i = 0; i < body->as.block.statements.count; i++) {
+                ASTNode *stmt = body->as.block.statements.items[i];
+                if (stmt && stmt->type == NODE_JOB_DECL) {
+                    nodelist_push(&job_block->as.block.statements, stmt);
+                }
+            }
+            compile_block(c, job_block);
+            /* Free the temporary block structure but not the statements */
+            free(job_block->as.block.statements.items);
+            free(job_block);
+        }
+        
+        c->module_prefix = saved_prefix;
+    }
+}
+
+static void module_finalize_jobs(VM *vm, Module *mod) {
+    for (int i = 0; i < mod->member_count; i++) {
+        ModMember *mm = &mod->members[i];
+        if (mm->kind == MOD_MEMBER_JOB && mm->is_exported) {
+            /* The job was registered with prefix modname#jobname.
+               Find it and record the internal name. */
+            char internal[128];
+            snprintf(internal, sizeof(internal), "%s#%s", mod->name, mm->name);
+            for (int j = 0; j < vm->job_count; j++) {
+                if (strcmp(vm->jobs[j].name, internal) == 0) {
+                    mm->job_internal = strdup(internal);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* Initialize a module: run its top-level statements to allocate SHIPped variables.
+   Returns 0 on success, 1 on error. */
+static int module_initialize(VM *vm, Module *mod) {
+    if (!mod->loaded || mod->peice_ast == NULL) return 0;
+    
+    /* Push a persistent scope for this module */
+    Scope *outer = vm->scope;
+    vm->scope = scope_push(outer);
+    mod->persistent_scope = vm->scope;
+    vm->active_module = mod - vm->modules;
+    vm->initializing_module = vm->active_module;
+    
+    /* Run the module's top-level statements (not JOB bodies, which are skipped via JUMP).
+       The module's PEICE body is an ASTNode block. We'll execute each statement
+       using the existing exec_simple_stmt function. */
+    ASTNode *body = mod->peice_ast->as.peice_decl.body;
+    if (body && body->type == NODE_BLOCK) {
+        for (int i = 0; i < body->as.block.statements.count; i++) {
+            ASTNode *stmt = body->as.block.statements.items[i];
+            if (!stmt) continue;
+            /* Skip JOB_DECL - these are handled separately via job registration */
+            if (stmt->type == NODE_JOB_DECL) continue;
+            /* Skip SHIP_STMT - already processed at load time */
+            if (stmt->type == NODE_SHIP_STMT) continue;
+            /* Skip BRING_STMT - nested modules already loaded */
+            if (stmt->type == NODE_BRING_STMT) continue;
+            /* Execute the statement */
+            exec_simple_stmt(vm, stmt);
+        }
+    }
+    
+    /* After running, scan the module's persistent scope for SHIPped variables
+       and record their VMA slots */
+    for (int i = 0; i < mod->member_count; i++) {
+        ModMember *mm = &mod->members[i];
+        if (mm->kind == MOD_MEMBER_VAR && mm->is_exported) {
+            Symbol *sym = scope_find_local(mod->persistent_scope, mm->name);
+            if (sym && sym->vma[0]) {
+                RVmaSlot *slot = rvma_lookup(&vm->vmas, sym->vma);
+                if (slot && slot->allocated) {
+                    mm->slot = slot;
+                }
+            }
+        }
+    }
+    
+    vm->active_module = -1;
+    vm->initializing_module = -1;
+    vm->scope = outer;
+    return 0;
+}
+    static void runtime_error(VM *vm, int line, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     fprintf(stderr, "[line %d] Runtime error: ", line);
@@ -593,10 +982,6 @@ static void enqueue(VM *vm, int handler_index, int has_values, Value old_v, Valu
     e->new_value = new_v;
 }
 
-/* =======================================================================
- * Scope pop w/ AUTOCLEAN (spec Sec 6.D): frees the VMA of every symbol
- * declared in this scope while AUTOCLEAN was ON.
- * ===================================================================== */
 static void scope_pop_with_autoclean(VM *vm) {
     Scope *s = vm->scope;
     for (int i = 0; i < s->count; i++) {
@@ -615,9 +1000,6 @@ static void scope_pop_with_autoclean(VM *vm) {
  * ===================================================================== */
 static Value eval_expr(VM *vm, ASTNode *node);
 
-/* Resolves an IDENTIFIER/VMA_REF/INDEX node to a direct pointer into
-   its actual storage, for in-place mutation. Returns NULL (after
-   raising a runtime error) if the target isn't currently valid. */
 static Value *lvalue_ptr(VM *vm, ASTNode *node, int line) {
     if (node->type == NODE_INDEX) {
         Value *arr = lvalue_ptr(vm, node->as.index_expr.array, line);
@@ -648,10 +1030,6 @@ static Value *lvalue_ptr(VM *vm, ASTNode *node, int line) {
     return NULL;
 }
 
-/* If `node` denotes a real VMA (directly, or via an identifier bound
-   to one - i.e. NOT a loop var, NOT OLD_VALUE/NEW_VALUE, NOT a COLL
-   index), returns that VMA's address so the write can go through
-   rvma_set() and trip WHEN handlers. Otherwise returns NULL. */
 static const char *target_vma_addr(VM *vm, ASTNode *node) {
     if (node->type == NODE_VMA_REF) return node->as.vma_ref.name;
     if (node->type == NODE_IDENTIFIER) {
@@ -675,16 +1053,12 @@ static void dispatch_triggers(VM *vm, const char *addr, Value old_v, int changed
             Value cv = eval_expr(vm, h->condition);
             int cur = value_to_bool(cv);
             value_free(&cv);
-            if (!h->last_state && cur) { enqueue(vm, i, 0, value_null(), value_null()); h->last_state = 1; }
+            if (!h->last_state && cur) { enqueue(vm, i, 0, value_emp(), value_emp()); h->last_state = 1; }
             else if (h->last_state && !cur) { h->last_state = 0; }
         }
     }
 }
 
-/* The single write path for any real VMA: compares old vs new (Sec
-   6.E's `CHANGED` rule), stores the new value, then evaluates every
-   registered handler for edge-triggering (Sec 6.E). Takes ownership
-   of `new_val`. */
 static void rvma_set(VM *vm, const char *addr, Value new_val, int line) {
     RVmaSlot *slot = rvma_lookup(&vm->vmas, addr);
     if (!slot || !slot->allocated) { value_free(&new_val); runtime_error(vm, line, "VMA %s is not allocated", addr); }
@@ -773,7 +1147,7 @@ static Value binary_op(VM *vm, VOTokenType op, Value l, Value r, int line) {
         case TOKEN_XOR: return value_yn(value_to_bool(l) ^ value_to_bool(r));
         default: runtime_error(vm, line, "unsupported operator");
     }
-    return value_null();
+    return value_emp();
 }
 
 static Value apply_assign_op(VM *vm, VOTokenType op, Value current, Value rhs, int line) {
@@ -790,19 +1164,36 @@ static Value apply_assign_op(VM *vm, VOTokenType op, Value current, Value rhs, i
         case TOKEN_STAR_ASSIGN: base = TOKEN_STAR; break;
         case TOKEN_SLASH_ASSIGN: base = TOKEN_SLASH; break;
         case TOKEN_PERCENT_ASSIGN: base = TOKEN_PERCENT; break;
-        default: runtime_error(vm, line, "unsupported assignment operator"); return value_null();
+        default: runtime_error(vm, line, "unsupported assignment operator"); return value_emp();
     }
     return binary_op(vm, base, current, rhs, line);
 }
 
+/* Forward declaration */
+static void run_range(VM *vm, int start);
+
+/* Module member resolution helpers */
+static ModMember *module_resolve_member(VM *vm, const char *mod_name, const char *member_name) {
+    Module *mod = module_find(vm, mod_name);
+    if (!mod || !mod->loaded) return NULL;
+    return module_member_find(mod, member_name);
+}
+
+static JobEntry *job_find_by_name(VM *vm, const char *name) {
+    for (int i = 0; i < vm->job_count; i++)
+        if (strcmp(vm->jobs[i].name, name) == 0)
+            return &vm->jobs[i];
+    return NULL;
+}
+
 static Value eval_expr(VM *vm, ASTNode *node) {
-    if (!node) return value_null();
+    if (!node) return value_emp();
     switch (node->type) {
         case NODE_NUM_LITERAL: return value_num(node->as.num_lit.value);
         case NODE_DEC_LITERAL: return value_dec(node->as.dec_lit.value);
         case NODE_TEX_LITERAL: return value_tex(node->as.tex_lit.value);
         case NODE_BOOL_LITERAL: return value_yn(node->as.bool_lit.value);
-        case NODE_NULL_LITERAL: return value_null();
+        case NODE_EMP_LITERAL: return value_emp();
 
         case NODE_VMA_REF: {
             RVmaSlot *slot = rvma_lookup(&vm->vmas, node->as.vma_ref.name);
@@ -833,7 +1224,7 @@ static Value eval_expr(VM *vm, ASTNode *node) {
             if (v.type == VAL_DEC) { double d = -v.dec; return value_dec(d); }
             if (v.type == VAL_NUM) { long n = -v.num; return value_num(n); }
             runtime_error(vm, node->line, "unary '-' needs a numeric operand");
-            return value_null();
+            return value_emp();
         }
 
         case NODE_BINARY: {
@@ -892,7 +1283,7 @@ static Value eval_expr(VM *vm, ASTNode *node) {
             long len;
             if (v.type == VAL_TEX) len = (long)strlen(v.tex ? v.tex : "");
             else if (v.type == VAL_COLL) len = v.count;
-            else { value_free(&v); runtime_error(vm, node->line, "LENGTH() needs a TEX or COLL argument"); return value_null(); }
+            else { value_free(&v); runtime_error(vm, node->line, "LENGTH() needs a TEX or COLL argument"); return value_emp(); }
             value_free(&v);
             return value_num(len);
         }
@@ -916,8 +1307,112 @@ static Value eval_expr(VM *vm, ASTNode *node) {
             return out;
         }
 
+        case NODE_MODULE_REF: {
+            /* module.member value reference - resolve to module member variable */
+            const char *mod_name = node->as.module_ref.module;
+            const char *member_name = node->as.module_ref.member;
+            ModMember *mm = module_resolve_member(vm, mod_name, member_name);
+            if (!mm) runtime_error(vm, node->line, "module '%s' has no member '%s'", mod_name, member_name);
+            if (!mm->is_exported) runtime_error(vm, node->line, "module '%s' member '%s' is not exported", mod_name, member_name);
+            if (mm->kind == MOD_MEMBER_VAR) {
+                if (!mm->slot || !mm->slot->allocated) runtime_error(vm, node->line, "module member '%s.%s' is not allocated", mod_name, member_name);
+                return value_copy(mm->slot->value);
+            } else {
+                runtime_error(vm, node->line, "module '%s' member '%s' is a job, not a value", mod_name, member_name);
+            }
+            return value_emp();
+        }
+
+        case NODE_CALL: {
+            JobEntry *job = NULL;
+            int saved_active_module = vm->active_module;
+            int call_active_module = -1;
+
+            if (node->as.call.callee->type == NODE_MODULE_REF) {
+                /* Module-member call: math.ADD(...) */
+                const char *mod_name = node->as.call.callee->as.module_ref.module;
+                const char *member_name = node->as.call.callee->as.module_ref.member;
+                ModMember *mm = module_resolve_member(vm, mod_name, member_name);
+                if (!mm) runtime_error(vm, node->line, "module '%s' has no member '%s'", mod_name, member_name);
+                if (!mm->is_exported) runtime_error(vm, node->line, "module '%s' member '%s' is not exported", mod_name, member_name);
+                if (mm->kind != MOD_MEMBER_JOB) runtime_error(vm, node->line, "module '%s' member '%s' is not a job", mod_name, member_name);
+                if (!mm->job_internal) runtime_error(vm, node->line, "module '%s' job '%s' not found (internal error)", mod_name, member_name);
+                job = job_find_by_name(vm, mm->job_internal);
+                if (!job) runtime_error(vm, node->line, "internal job '%s' not found", mm->job_internal);
+                call_active_module = module_find(vm, mod_name) - vm->modules;
+            } else if (node->as.call.callee->type == NODE_IDENTIFIER) {
+                /* Direct call - could be a bare call to a sibling job inside
+                   the same module (SHIPped or not - SHIP only controls
+                   external/cross-module visibility, not intra-module
+                   callability). Try the current module's own jobs first via
+                   their "module#job" registered name, then fall back to a
+                   top-level job of the same name. */
+                const char *job_name = node->as.call.callee->as.identifier.name;
+                job = NULL;
+                if (vm->active_module >= 0) {
+                    Module *mod = &vm->modules[vm->active_module];
+                    char qualified[128];
+                    snprintf(qualified, sizeof(qualified), "%s#%s", mod->name, job_name);
+                    job = job_find_by_name(vm, qualified);
+                    if (job) call_active_module = vm->active_module;
+                }
+                if (!job) job = job_find_by_name(vm, job_name);
+                if (!job) runtime_error(vm, node->line, "undefined job '%s'", job_name);
+            } else {
+                runtime_error(vm, node->line, "only direct function calls are supported");
+            }
+
+            /* Evaluate arguments */
+            int nargs = node->as.call.args.count;
+            if (nargs != job->param_count)
+                runtime_error(vm, node->line, "job '%s' expects %d arguments but got %d",
+                              job->name, job->param_count, nargs);
+
+            Value *args = nargs ? malloc(sizeof(Value) * nargs) : NULL;
+            for (int i = 0; i < nargs; i++)
+                args[i] = eval_expr(vm, node->as.call.args.items[i]);
+
+            /* Save VM state */
+            Scope *saved_scope = vm->scope;
+            int saved_giving = vm->giving;
+            Value saved_give = vm->give_value;
+            vm->giving = 0;
+
+            /* Push scope, bind params as VMA-backed variables */
+            vm->scope = scope_push(saved_scope);
+            for (int i = 0; i < nargs; i++) {
+                RVmaSlot *slot = rvma_alloc_next(&vm->vmas, job->params[i].name);
+                Symbol *sym = scope_declare(vm->scope, job->params[i].name);
+                snprintf(sym->vma, sizeof(sym->vma), "%s", slot->address);
+                value_free(&slot->value);
+                slot->value = args[i];
+            }
+
+            /* Set active module for this job execution */
+            vm->active_module = call_active_module;
+
+            /* Run the job body */
+            run_range(vm, job->body_start);
+
+            /* Get result */
+            Value result = vm->giving ? vm->give_value : value_emp();
+
+            /* Restore state */
+            vm->give_value = saved_give;
+            vm->giving = saved_giving;
+            vm->active_module = saved_active_module;
+
+            /* Pop scope (frees param VMAs via AUTOCLEAN if set) */
+            scope_pop_with_autoclean(vm);
+
+            /* Free args array (values are now in VMAs or copied) */
+            free(args);
+
+            return result;
+        }
+
         default:
-            return value_null();
+            return value_emp();
     }
 }
 
@@ -931,12 +1426,12 @@ static Value default_value_for_type(VOTokenType t) {
         case TOKEN_TYPE_TEX: return value_tex("");
         case TOKEN_TYPE_YN:  return value_yn(0);
         case TOKEN_TYPE_COLL: return value_coll_empty();
-        default: return value_null();
+        case TOKEN_TYPE_EMP: return value_emp();
+        default: return value_emp();
     }
 }
 
 static void exec_var_decl(VM *vm, ASTNode *node) {
-    int is_const = node->type == NODE_CONST_DECL;
     const char *name = node->as.var_decl.name;
     ASTNode *init = node->as.var_decl.init;
     int is_aliasing_form = init && init->type == NODE_VMA_REF;
@@ -947,8 +1442,11 @@ static void exec_var_decl(VM *vm, ASTNode *node) {
     RVmaSlot *slot;
     if (is_aliasing_form) {
         const char *addr = init->as.vma_ref.name;
-        slot = rvma_alloc_specific(&vm->vmas, addr, name);
-        if (!slot) runtime_error(vm, node->line, "cannot bind '%s' to %s - already allocated (aliasing is banned)", name, addr);
+        slot = rvma_slot_for_index(&vm->vmas, vma_canonical_index(addr));
+        if (slot->allocated) runtime_error(vm, node->line, "cannot bind '%s' to %s - already allocated (aliasing is banned)", name, addr);
+        slot->allocated = 1;
+        free(slot->owner);
+        slot->owner = strdup(name);
         slot->value = default_value_for_type(node->as.var_decl.var_type);
     } else {
         Value initval = eval_expr(vm, init);
@@ -957,7 +1455,23 @@ static void exec_var_decl(VM *vm, ASTNode *node) {
     }
 
     Symbol *sym = scope_declare(vm->scope, name);
-    sym->is_const = is_const;
+    sym->autocleans = vm->autoclean_on;
+    snprintf(sym->vma, sizeof(sym->vma), "%s", slot->address);
+}
+
+static void exec_hard_decl(VM *vm, ASTNode *node) {
+    const char *name = node->as.hard_decl.name;
+    ASTNode *value_expr = node->as.hard_decl.value;
+
+    if (scope_find_local(vm->scope, name))
+        runtime_error(vm, node->line, "'%s' is already declared in this scope", name);
+
+    Value val = eval_expr(vm, value_expr);
+    RVmaSlot *slot = rvma_alloc_next(&vm->vmas, name);
+    slot->value = val;
+
+    Symbol *sym = scope_declare(vm->scope, name);
+    sym->is_const = 1;
     sym->autocleans = vm->autoclean_on;
     snprintf(sym->vma, sizeof(sym->vma), "%s", slot->address);
 }
@@ -993,8 +1507,10 @@ static void do_assign(VM *vm, ASTNode *target, VOTokenType op, Value rhs, int li
 static void exec_simple_stmt(VM *vm, ASTNode *node) {
     switch (node->type) {
         case NODE_VAR_DECL:
-        case NODE_CONST_DECL:
             exec_var_decl(vm, node);
+            break;
+        case NODE_HARD_DECL:
+            exec_hard_decl(vm, node);
             break;
         case NODE_EXPR_STMT: {
             Value v = eval_expr(vm, node->as.expr_stmt.expr);
@@ -1027,6 +1543,175 @@ static void exec_simple_stmt(VM *vm, ASTNode *node) {
             break;
         case NODE_AUTOCLEAN_STMT:
             vm->autoclean_on = node->as.autoclean_stmt.on;
+            break;
+        case NODE_DEMAND_STMT: {
+            Value cond = eval_expr(vm, node->as.demand_stmt.condition);
+            int b = value_to_bool(cond);
+            value_free(&cond);
+            if (!b) {
+                if (node->as.demand_stmt.message)
+                    runtime_error(vm, node->line, "DEMAND failed: %s", node->as.demand_stmt.message);
+                else
+                    runtime_error(vm, node->line, "DEMAND condition not met");
+            }
+            break;
+        }
+        case NODE_SERVE_STMT: {
+            Value v = eval_expr(vm, node->as.serve_stmt.value);
+            char *msg = value_to_cstr(v);
+            value_free(&v);
+            if (vm->do_depth > 0) {
+                /* Jump to the GRABE handler */
+                free(msg);
+                longjmp(vm->do_catch_buf, 1);
+            }
+            runtime_error(vm, node->line, "SERVE: %s", msg);
+            free(msg);
+            break;
+        }
+        case NODE_DO_STMT: {
+            int saved_depth = vm->do_depth;
+            vm->do_depth++;
+            if (setjmp(vm->do_catch_buf)) {
+                /* Caught an issue - run the catch block */
+                vm->do_depth = saved_depth;
+                /* We need to execute the catch block statements. Since we have the AST,
+                   walk it directly. */
+                vm->scope = scope_push(vm->scope);
+                {
+                    ASTNode *catch = node->as.do_stmt.catch_block;
+                    if (catch) {
+                        for (int i = 0; i < catch->as.block.statements.count; i++) {
+                            ASTNode *stmt = catch->as.block.statements.items[i];
+                            if (!stmt) continue;
+                            /* Execute each statement directly */
+                            switch (stmt->type) {
+                                case NODE_SHOW_STMT: {
+                                    Value v = eval_expr(vm, stmt->as.show_stmt.expr);
+                                    char *s = value_to_cstr(v);
+                                    printf("%s\n", s);
+                                    free(s);
+                                    value_free(&v);
+                                    break;
+                                }
+                                case NODE_EXPR_STMT: {
+                                    Value v = eval_expr(vm, stmt->as.expr_stmt.expr);
+                                    value_free(&v);
+                                    break;
+                                }
+                                case NODE_VAR_DECL:
+                                    exec_var_decl(vm, stmt);
+                                    break;
+                                case NODE_ASSIGN: {
+                                    Value rhs = eval_expr(vm, stmt->as.assign.value);
+                                    const char *addr = target_vma_addr(vm, stmt->as.assign.target);
+                                    if (addr) {
+                                        RVmaSlot *slot = rvma_lookup(&vm->vmas, addr);
+                                        if (slot && slot->allocated) {
+                                            Value newval = apply_assign_op(vm, stmt->as.assign.op, slot->value, rhs, stmt->line);
+                                            value_free(&rhs);
+                                            rvma_set(vm, addr, newval, stmt->line);
+                                        } else { value_free(&rhs); }
+                                    } else {
+                                        Value *ptr = lvalue_ptr(vm, stmt->as.assign.target, stmt->line);
+                                        if (ptr) {
+                                            Value newval = apply_assign_op(vm, stmt->as.assign.op, *ptr, rhs, stmt->line);
+                                            value_free(&rhs);
+                                            value_free(ptr);
+                                            *ptr = newval;
+                                        } else { value_free(&rhs); }
+                                    }
+                                    break;
+                                }
+                                default: {
+                                    Value v = eval_expr(vm, stmt);
+                                    value_free(&v);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                scope_pop_with_autoclean(vm);
+                vm->do_depth = saved_depth;
+                return;
+            }
+            /* Try block - execute statements directly */
+            vm->scope = scope_push(vm->scope);
+            {
+                ASTNode *try_block = node->as.do_stmt.try_block;
+                if (try_block) {
+                    for (int i = 0; i < try_block->as.block.statements.count; i++) {
+                        ASTNode *stmt = try_block->as.block.statements.items[i];
+                        if (!stmt) continue;
+                        switch (stmt->type) {
+                            case NODE_SHOW_STMT: {
+                                Value v = eval_expr(vm, stmt->as.show_stmt.expr);
+                                char *s = value_to_cstr(v);
+                                printf("%s\n", s);
+                                free(s);
+                                value_free(&v);
+                                break;
+                            }
+                            case NODE_EXPR_STMT: {
+                                Value v = eval_expr(vm, stmt->as.expr_stmt.expr);
+                                value_free(&v);
+                                break;
+                            }
+                            case NODE_VAR_DECL:
+                                exec_var_decl(vm, stmt);
+                                break;
+                            case NODE_SERVE_STMT: {
+                                /* SERVE inside DO - longjmp to catch */
+                                longjmp(vm->do_catch_buf, 1);
+                                break;
+                            }
+                            case NODE_DEMAND_STMT: {
+                                /* DEMAND inside DO - if the condition fails, route
+                                   control to the GRABE handler instead of aborting */
+                                Value cond = eval_expr(vm, stmt->as.demand_stmt.condition);
+                                int b = value_to_bool(cond);
+                                value_free(&cond);
+                                if (!b) longjmp(vm->do_catch_buf, 1);
+                                break;
+                            }
+                            case NODE_ASSIGN: {
+                                Value rhs = eval_expr(vm, stmt->as.assign.value);
+                                const char *addr = target_vma_addr(vm, stmt->as.assign.target);
+                                if (addr) {
+                                    RVmaSlot *slot = rvma_lookup(&vm->vmas, addr);
+                                    if (slot && slot->allocated) {
+                                        Value newval = apply_assign_op(vm, stmt->as.assign.op, slot->value, rhs, stmt->line);
+                                        value_free(&rhs);
+                                        rvma_set(vm, addr, newval, stmt->line);
+                                    } else { value_free(&rhs); }
+                                } else {
+                                    Value *ptr = lvalue_ptr(vm, stmt->as.assign.target, stmt->line);
+                                    if (ptr) {
+                                        Value newval = apply_assign_op(vm, stmt->as.assign.op, *ptr, rhs, stmt->line);
+                                        value_free(&rhs);
+                                        value_free(ptr);
+                                        *ptr = newval;
+                                    } else { value_free(&rhs); }
+                                }
+                                break;
+                            }
+                            default: {
+                                Value v = eval_expr(vm, stmt);
+                                value_free(&v);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            scope_pop_with_autoclean(vm);
+            vm->do_depth = saved_depth;
+            return;
+        }
+        case NODE_BRING_STMT:
+        case NODE_SHIP_STMT:
+            /* Module system stub */
             break;
         default:
             break;
@@ -1080,7 +1765,6 @@ static void register_handler(VM *vm, Instr *ins) {
     h->body_start = ins->target2;
 }
 
-/* One step of the shared instruction interpreter. */
 static int step(VM *vm, int pc) {
     Instr *ins = &vm->code[pc];
     switch (ins->kind) {
@@ -1099,32 +1783,27 @@ static int step(VM *vm, int pc) {
         case I_SCOPE_PUSH: vm->scope = scope_push(vm->scope); return pc + 1;
         case I_SCOPE_POP: scope_pop_with_autoclean(vm); return pc + 1;
         case I_WHEN_REGISTER: register_handler(vm, ins); return pc + 1;
-        case I_HANDLER_RETURN: return pc + 1; /* no-op outside run_range */
+        case I_HANDLER_RETURN: return pc + 1;
+        case I_GIVE: {
+            /* Evaluate the expression and set the give value */
+            ASTNode *give_node = ins->node;
+            Value v = eval_expr(vm, give_node->as.give_stmt.value);
+            vm->give_value = v;
+            vm->giving = 1;
+            return pc + 1;
+        }
     }
     return pc + 1;
 }
 
-/* Runs a handler's body (compiled at `start`) to completion. This is
-   a *separate* execution context from the main loop's, deliberately:
-   it must NOT drain the event queue itself (spec Sec 6.E - "the
-   currently executing statement or handler finishes completely before
-   the queue is drained"; a handler's own assignments still enqueue -
-   dispatch_triggers() runs unconditionally inside rvma_set() - but
-   invoking those newly-queued handlers waits for drain_queue()'s own
-   loop to get to them, which is what makes dispatch breadth-first
-   instead of recursive). A generous instruction-count guard protects
-   against a handler whose body GOTOs out to code that never reaches
-   this handler's I_HANDLER_RETURN (an inherently pathological mix of
-   unstructured GOTO and event dispatch that the spec doesn't define). */
 static void run_range(VM *vm, int start) {
     int pc = start;
     long guard = 0;
-    while (pc >= 0 && pc < vm->code_count && vm->code[pc].kind != I_HANDLER_RETURN) {
+    while (pc >= 0 && pc < vm->code_count && vm->code[pc].kind != I_HANDLER_RETURN && !vm->giving) {
         pc = step(vm, pc);
         if (++guard > 2000000L)
             runtime_error(vm, vm->code[start].node ? vm->code[start].node->line : 0,
-                          "handler execution exceeded its instruction budget "
-                          "(a GOTO likely jumped out of the handler body without returning)");
+                          "handler execution exceeded its instruction budget");
     }
 }
 
@@ -1161,37 +1840,122 @@ static void drain_queue(VM *vm) {
 /* =======================================================================
  * Public entry point
  * ===================================================================== */
-int run_program(ASTNode *program) {
-    VM vm;
-    memset(&vm, 0, sizeof(vm));
-    vm.max_queue_depth = DEFAULT_MAX_QUEUE_DEPTH;
+int run_program(ASTNode *program, const char *source_path) {
+    VM *vm = calloc(1, sizeof(VM));
+    if (!vm) return 1;
+    vm->max_queue_depth = DEFAULT_MAX_QUEUE_DEPTH;
+
+    /* Extract source directory from path for BRING resolution */
+    char source_dir[4096];
+    strncpy(source_dir, source_path, sizeof(source_dir) - 1);
+    source_dir[sizeof(source_dir) - 1] = '\0';
+    char *slash = strrchr(source_dir, '/');
+    if (slash) *slash = '\0';
+    else if ((slash = strrchr(source_dir, '\\'))) *slash = '\0';
+    else { source_dir[0] = '.'; source_dir[1] = '\0'; } /* no dir component: file is in cwd, not filesystem root */
 
     Compiler c;
     InstrList code;
-    compile_program(&c, program, &code);
+    /* module_load() (called from inside compile_program, while resolving
+       BRING) reports failures via runtime_error(), which longjmps rather
+       than returning normally - so that failure has to be caught by a
+       setjmp established *before* compile_program runs, not just handled
+       via c.had_error afterward. compile_program() zeroes both `c` and
+       `code` before doing anything else, so if we do land back here via
+       longjmp, freeing their (NULL) fields below is always safe. */
+    if (setjmp(vm->abort_buf)) {
+        free(code.items);
+        for (int i = 0; i < c.label_count; i++) free(c.labels[i].name);
+        free(c.labels);
+        for (int i = 0; i < c.pending_count; i++) free(c.pending[i].label);
+        free(c.pending);
+        for (int i = 0; i < c.job_count; i++) {
+            free(c.jobs[i].name);
+            for (int j = 0; j < c.jobs[i].param_count; j++) free(c.jobs[i].params[j].name);
+            free(c.jobs[i].params);
+        }
+        free(c.jobs);
+        free(vm);
+        return 1;
+    }
+    compile_program(&c, vm, program, source_dir, &code);
     if (c.had_error) {
         free(code.items);
         for (int i = 0; i < c.label_count; i++) free(c.labels[i].name);
         free(c.labels);
         for (int i = 0; i < c.pending_count; i++) free(c.pending[i].label);
         free(c.pending);
+        for (int i = 0; i < c.job_count; i++) {
+            free(c.jobs[i].name);
+            for (int j = 0; j < c.jobs[i].param_count; j++) free(c.jobs[i].params[j].name);
+            free(c.jobs[i].params);
+        }
+        free(c.jobs);
+        free(vm);
         return 1;
     }
-    vm.code = code.items;
-    vm.code_count = code.count;
+    vm->code = code.items;
+    vm->code_count = code.count;
+    vm->jobs = c.jobs;
+    vm->job_count = c.job_count;
 
-    if (setjmp(vm.abort_buf)) {
-        return 1; /* leaks state on abort - acceptable for a one-shot CLI run */
+    /* Finalize module jobs after compilation */
+    for (int m = 0; m < vm->module_count; m++) {
+        Module *mod = &vm->modules[m];
+        if (mod->loaded) {
+            module_finalize_jobs(vm, mod);
+        }
     }
 
-    vm.scope = scope_push(NULL);
+    /* Initialize modules: run their top-level statements to allocate SHIPped variables.
+       This can itself call runtime_error() (e.g. a bad expression in a
+       module-level HARD/VAR init) - re-arm the same jmp_buf right here so
+       that also lands somewhere valid instead of jumping to whatever
+       (by-then-stale) context the setjmp() above captured. */
+    if (setjmp(vm->abort_buf)) {
+        free(vm->code);
+        free(vm);
+        return 1;
+    }
+    for (int m = 0; m < vm->module_count; m++) {
+        Module *mod = &vm->modules[m];
+        if (mod->loaded) {
+            module_initialize(vm, mod);
+        }
+    }
+
+    vm->scope = scope_push(NULL);
 
     int pc = 0;
-    while (pc >= 0 && pc < vm.code_count) {
-        pc = step(&vm, pc);
-        drain_queue(&vm);
+    while (pc >= 0 && pc < vm->code_count) {
+        pc = step(vm, pc);
+        drain_queue(vm);
     }
-    scope_pop_with_autoclean(&vm);
+    scope_pop_with_autoclean(vm);
 
-    return vm.had_runtime_error ? 1 : 0;
+    /* Cleanup jobs */
+    for (int i = 0; i < vm->job_count; i++) {
+        free(vm->jobs[i].name);
+        for (int j = 0; j < vm->jobs[i].param_count; j++) free(vm->jobs[i].params[j].name);
+        free(vm->jobs[i].params);
+    }
+    free(vm->jobs);
+
+    /* Cleanup modules */
+    for (int m = 0; m < vm->module_count; m++) {
+        Module *mod = &vm->modules[m];
+        free(mod->name);
+        for (int i = 0; i < mod->member_count; i++) {
+            free(mod->members[i].name);
+            if (mod->members[i].job_internal) free(mod->members[i].job_internal);
+        }
+        free(mod->members);
+        if (mod->peice_ast) ast_free(mod->peice_ast);
+    }
+    free(vm->modules);
+
+    int rc = vm->had_runtime_error ? 1 : 0;
+    free(vm->code);
+    free(vm);
+    return rc;
 }

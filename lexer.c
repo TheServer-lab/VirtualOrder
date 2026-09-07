@@ -12,12 +12,12 @@ typedef struct { const char *text; VOTokenType type; } Keyword;
 
 static const Keyword KEYWORDS[] = {
     {"VAR",        TOKEN_VAR},
-    {"CONST",      TOKEN_CONST},
+    {"HARD",       TOKEN_HARD},
     {"EAQ",        TOKEN_EAQ},
     {"STORE",      TOKEN_STORE},
     {"LOAD",       TOKEN_LOAD},
     {"SHOW",       TOKEN_SHOW},
-    {"CLEANALL",   TOKEN_CLEANALL},   /* must precede CLEAN check order-wise; exact match anyway */
+    {"CLEANALL",   TOKEN_CLEANALL},
     {"CLEAN",      TOKEN_CLEAN},
     {"AUTOCLEAN",  TOKEN_AUTOCLEAN},
     {"ON",         TOKEN_ON},
@@ -52,12 +52,28 @@ static const Keyword KEYWORDS[] = {
     {"TEX",        TOKEN_TYPE_TEX},
     {"YN",         TOKEN_TYPE_YN},
     {"COLL",       TOKEN_TYPE_COLL},
+    {"EMP",        TOKEN_TYPE_EMP},
 
     {"YES",        TOKEN_YES},
     {"NO",         TOKEN_NO},
-    {"NULL",       TOKEN_NULL},
 
     {"LENGTH",     TOKEN_LENGTH},
+
+    {"JOB",        TOKEN_JOB},
+    {"ENDJOB",     TOKEN_ENDJOB},
+    {"GIVE",       TOKEN_GIVE},
+
+    {"PEICE",      TOKEN_PEICE},
+    {"ENDPEICE",   TOKEN_ENDPEICE},
+    {"BRING",      TOKEN_BRING},
+    {"SHIP",       TOKEN_SHIP},
+
+    {"DEMAND",     TOKEN_DEMAND},
+    {"DO",         TOKEN_DO},
+    {"GRABE",      TOKEN_GRABE},
+    {"ENDDO",      TOKEN_ENDDO},
+    {"SERVE",      TOKEN_SERVE},
+    {"ISSUE",      TOKEN_ISSUE},
 };
 #define NUM_KEYWORDS (int)(sizeof(KEYWORDS) / sizeof(KEYWORDS[0]))
 
@@ -70,8 +86,14 @@ const char *token_type_name(VOTokenType type) {
         case TOKEN_TEX_LITERAL: return "TEX_LITERAL";
         case TOKEN_VMA: return "VMA";
         case TOKEN_IDENTIFIER: return "IDENTIFIER";
+        case TOKEN_TYPE_NUM: return "TYPE_NUM";
+        case TOKEN_TYPE_DEC: return "TYPE_DEC";
+        case TOKEN_TYPE_TEX: return "TYPE_TEX";
+        case TOKEN_TYPE_YN: return "TYPE_YN";
+        case TOKEN_TYPE_COLL: return "TYPE_COLL";
+        case TOKEN_TYPE_EMP: return "TYPE_EMP";
         case TOKEN_VAR: return "VAR";
-        case TOKEN_CONST: return "CONST";
+        case TOKEN_HARD: return "HARD";
         case TOKEN_EAQ: return "EAQ";
         case TOKEN_STORE: return "STORE";
         case TOKEN_LOAD: return "LOAD";
@@ -102,15 +124,23 @@ const char *token_type_name(VOTokenType type) {
         case TOKEN_AND: return "AND";
         case TOKEN_OR: return "OR";
         case TOKEN_XOR: return "XOR";
-        case TOKEN_TYPE_NUM: return "TYPE_NUM";
-        case TOKEN_TYPE_DEC: return "TYPE_DEC";
-        case TOKEN_TYPE_TEX: return "TYPE_TEX";
-        case TOKEN_TYPE_YN: return "TYPE_YN";
-        case TOKEN_TYPE_COLL: return "TYPE_COLL";
         case TOKEN_YES: return "YES";
         case TOKEN_NO: return "NO";
-        case TOKEN_NULL: return "NULL";
+        case TOKEN_EMP: return "EMP";
         case TOKEN_LENGTH: return "LENGTH";
+        case TOKEN_JOB: return "JOB";
+        case TOKEN_ENDJOB: return "ENDJOB";
+        case TOKEN_GIVE: return "GIVE";
+        case TOKEN_PEICE: return "PEICE";
+        case TOKEN_ENDPEICE: return "ENDPEICE";
+        case TOKEN_BRING: return "BRING";
+        case TOKEN_SHIP: return "SHIP";
+        case TOKEN_DEMAND: return "DEMAND";
+        case TOKEN_DO: return "DO";
+        case TOKEN_GRABE: return "GRABE";
+        case TOKEN_ENDDO: return "ENDDO";
+        case TOKEN_SERVE: return "SERVE";
+        case TOKEN_ISSUE: return "ISSUE";
         case TOKEN_PLUS: return "PLUS";
         case TOKEN_MINUS: return "MINUS";
         case TOKEN_STAR: return "STAR";
@@ -142,6 +172,7 @@ const char *token_type_name(VOTokenType type) {
         case TOKEN_RBRACKET: return "RBRACKET";
         case TOKEN_COMMA: return "COMMA";
         case TOKEN_COLON: return "COLON";
+        case TOKEN_DOT: return "DOT";
         case TOKEN_NEWLINE: return "NEWLINE";
         default: return "UNKNOWN";
     }
@@ -203,7 +234,7 @@ static Token error_token(Lexer *lx, const char *msg) {
 static void skip_whitespace_and_comments(Lexer *lx) {
     for (;;) {
         if (lx->in_block_comment) {
-            if (is_at_end(lx)) return; /* unterminated block comment -> EOF */
+            if (is_at_end(lx)) return;
             if (peek(lx) == ';' && peek_next(lx) == ';') {
                 advance(lx); advance(lx);
                 lx->in_block_comment = 0;
@@ -222,9 +253,6 @@ static void skip_whitespace_and_comments(Lexer *lx) {
                 break;
 
             case '\n':
-                /* Newlines are significant (statement separators) in
-                   Virtual Order, so we emit a NEWLINE token rather than
-                   silently skipping them. Caller handles that. */
                 return;
 
             case ';':
@@ -233,7 +261,6 @@ static void skip_whitespace_and_comments(Lexer *lx) {
                     lx->in_block_comment = 1;
                     break;
                 }
-                /* line comment: consume to end of line */
                 while (peek(lx) != '\n' && !is_at_end(lx)) advance(lx);
                 break;
 
@@ -256,7 +283,7 @@ static int is_vma_lexeme(const char *s, int len) {
     while (i < len && s[i] >= '0' && s[i] <= '9') { i++; digit_count++; }
     if (digit_count == 0) return 0;
 
-    return i == len; /* the whole lexeme must be consumed by letters+digits */
+    return i == len;
 }
 
 /* ---------------------------------------------------------------------
@@ -268,9 +295,6 @@ static Token scan_identifier_or_keyword_or_vma(Lexer *lx) {
     int len = (int)(lx->current - lx->start);
     const char *lexeme = lx->start;
 
-    /* underscore anywhere disqualifies VMA/keyword-exact-match shortcuts
-       for VMA, but OLD_VALUE / NEW_VALUE are keywords containing '_',
-       so keyword check still needs to run first regardless. */
     for (int k = 0; k < NUM_KEYWORDS; k++) {
         size_t klen = strlen(KEYWORDS[k].text);
         if ((int)klen == len && strncmp(KEYWORDS[k].text, lexeme, len) == 0) {
@@ -292,7 +316,7 @@ static Token scan_number(Lexer *lx) {
     while (isdigit((unsigned char)peek(lx))) advance(lx);
 
     if (peek(lx) == '.' && isdigit((unsigned char)peek_next(lx))) {
-        advance(lx); /* consume '.' */
+        advance(lx);
         while (isdigit((unsigned char)peek(lx))) advance(lx);
         return make_token(lx, TOKEN_DEC_LITERAL);
     }
@@ -305,12 +329,12 @@ static Token scan_number(Lexer *lx) {
 static Token scan_string(Lexer *lx) {
     while (peek(lx) != '"' && !is_at_end(lx)) {
         if (peek(lx) == '\\' && peek_next(lx) != '\0') {
-            advance(lx); /* skip escape marker */
+            advance(lx);
         }
         advance(lx);
     }
     if (is_at_end(lx)) return error_token(lx, "Unterminated string literal");
-    advance(lx); /* closing quote */
+    advance(lx);
     return make_token(lx, TOKEN_TEX_LITERAL);
 }
 
@@ -352,6 +376,7 @@ Token lexer_next_token(Lexer *lx) {
         case ']': return make_token(lx, TOKEN_RBRACKET);
         case ',': return make_token(lx, TOKEN_COMMA);
         case ':': return make_token(lx, TOKEN_COLON);
+        case '.': return make_token(lx, TOKEN_DOT);
 
         case '*':
             if (match(lx, '*')) return make_token(lx, TOKEN_POWER);

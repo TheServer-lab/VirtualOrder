@@ -229,9 +229,17 @@ int main(int argc, char **argv) {
 #endif
     }
 
+    char source_dir[4096];
+    strncpy(source_dir, vo_path, sizeof(source_dir) - 1);
+    source_dir[sizeof(source_dir) - 1] = '\0';
+    char *slash = strrchr(source_dir, '/');
+    if (slash) *slash = '\0';
+    else if ((slash = strrchr(source_dir, '\\'))) *slash = '\0';
+    else { source_dir[0] = '.'; source_dir[1] = '\0'; } /* no dir component: file is in cwd, not filesystem root */
+
     FILE *out = fopen(asm_path, "w");
     if (!out) { perror("fopen"); free(source); return 1; }
-    int rc = codegen_compile(program, target, out);
+    int rc = codegen_compile(program, target, source_dir, out);
     fclose(out);
 
     if (rc != 0) {

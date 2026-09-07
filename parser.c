@@ -22,7 +22,6 @@ static void error_at(Parser *p, Token t, const char *msg) {
 static void advance(Parser *p) {
     p->current = p->next;
     p->next = lexer_next_token(&p->lexer);
-    /* Surface lexer errors as parse errors rather than silently consuming them */
     while (p->current.type == TOKEN_ERROR) {
         error_at(p, p->current, "lexical error");
         p->current = p->next;
@@ -47,8 +46,6 @@ static void skip_newlines(Parser *p) {
     while (check(p, TOKEN_NEWLINE)) advance(p);
 }
 
-/* A statement must end at a newline (or EOF, for the final statement in
-   a file). This also tolerates blank lines after the statement. */
 static void expect_statement_end(Parser *p) {
     if (check(p, TOKEN_EOF)) return;
     if (!check(p, TOKEN_NEWLINE)) {
@@ -64,7 +61,8 @@ static int is_assign_op(VOTokenType t) {
 }
 
 static int is_valid_assign_target(ASTNode *n) {
-    return n->type == NODE_IDENTIFIER || n->type == NODE_VMA_REF || n->type == NODE_INDEX;
+    return n->type == NODE_IDENTIFIER || n->type == NODE_VMA_REF || n->type == NODE_INDEX
+        || n->type == NODE_MODULE_REF;
 }
 
 /* ---------------------------------------------------------------------
@@ -76,36 +74,15 @@ static ASTNode *parse_statement(Parser *p);
 static ASTNode *parse_conditional(Parser *p, int negate_condition);
 
 /* ---------------------------------------------------------------------
- * Expression grammar (highest precedence number = tightest binding,
- * matching the Virtual Order v1.2 precedence table).
- *
- *   expression   -> assignment
- *   assignment   -> logic_or ( assign_op assignment )?      [right-assoc]
- *   logic_or     -> logic_xor ( OR logic_xor )*
- *   logic_xor    -> logic_and ( XOR logic_and )*
- *   logic_and    -> not_expr ( AND not_expr )*
- *   not_expr     -> NOT not_expr | comparison
- *   comparison   -> bit_or ( (==|!=|<|>|<=|>=) bit_or )*
- *   bit_or       -> bit_xor ( '|' bit_xor )*
- *   bit_xor      -> bit_and ( '^' bit_and )*
- *   bit_and      -> shift ( '&' shift )*
- *   shift        -> additive ( (<<|>>) additive )*
- *   additive     -> multiplicative ( (+|-) multiplicative )*
- *   multiplicative -> unary ( (*|/|%) unary )*
- *   unary        -> '-' unary | power
- *   power        -> primary ( '**' unary )?                 [right-assoc]
- *   primary      -> literals | VMA | IDENTIFIER | LOAD VMA |
- *                   LENGTH '(' expression ')' | '(' expression ')' |
- *                   '[' array_elements ']'
- *                   (each followed by any number of '[' expr ']' index
- *                    postfixes)
- *
- * NOTE (flagged, not in the original spec table): unary minus isn't
- * listed as its own precedence level. It's implemented here as binding
- * tighter than * / % but looser than ** — matching the common
- * convention (e.g. Python) where `-2 ** 2` == `-(2 ** 2)` == -4, not
- * `(-2) ** 2` == 4. Confirm this is the semantics you want; if not,
- * swap the unary/power call order below.
+ * Type keyword check (for VAR/HARD/JOB params)
+ * ------------------------------------------------------------------- */
+static int is_type_keyword(VOTokenType t) {
+    return t == TOKEN_TYPE_NUM || t == TOKEN_TYPE_DEC || t == TOKEN_TYPE_TEX ||
+           t == TOKEN_TYPE_YN  || t == TOKEN_TYPE_COLL || t == TOKEN_TYPE_EMP;
+}
+
+/* ---------------------------------------------------------------------
+ * Expression grammar
  * ------------------------------------------------------------------- */
 
 static ASTNode *make_binary(VOTokenType op, ASTNode *left, ASTNode *right, int line) {
@@ -152,8 +129,6 @@ static ASTNode *parse_primary(Parser *p) {
         }
         case TOKEN_TEX_LITERAL: {
             advance(p);
-            /* strip surrounding quotes; leave escapes as-is for now
-               (a later lexer/parser pass can unescape if needed) */
             ASTNode *n = ast_new(NODE_TEX_LITERAL, t.line);
             char *raw = token_text(t);
             int len = (int)strlen(raw);
@@ -176,9 +151,10 @@ static ASTNode *parse_primary(Parser *p) {
             n->as.bool_lit.value = 0;
             return n;
         }
-        case TOKEN_NULL: {
+        case TOKEN_EMP:
+        case TOKEN_TYPE_EMP: {
             advance(p);
-            return ast_new(NODE_NULL_LITERAL, t.line);
+            return ast_new(NODE_EMP_LITERAL, t.line);
         }
         case TOKEN_VMA: {
             advance(p);
@@ -195,13 +171,13 @@ static ASTNode *parse_primary(Parser *p) {
         case TOKEN_OLD_VALUE: {
             advance(p);
             ASTNode *n = ast_new(NODE_IDENTIFIER, t.line);
-            n->as.identifier.name = token_text(t); /* lexeme is already "OLD_VALUE" */
+            n->as.identifier.name = token_text(t);
             return n;
         }
         case TOKEN_NEW_VALUE: {
             advance(p);
             ASTNode *n = ast_new(NODE_IDENTIFIER, t.line);
-            n->as.identifier.name = token_text(t); /* lexeme is already "NEW_VALUE" */
+            n->as.identifier.name = token_text(t);
             return n;
         }
         case TOKEN_LOAD: {
@@ -234,23 +210,68 @@ static ASTNode *parse_primary(Parser *p) {
 
         default:
             error_at(p, t, "expected an expression");
-            advance(p); /* avoid infinite loop on malformed input */
-            return ast_new(NODE_NULL_LITERAL, t.line);
+            advance(p);
+            return ast_new(NODE_EMP_LITERAL, t.line);
     }
 }
 
-/* primary, with postfix `[index]` chaining, e.g. History[I][0] */
+/* Primary, with postfix [index], (call), and .member chaining */
 static ASTNode *parse_postfix(Parser *p) {
     ASTNode *node = parse_primary(p);
-    while (check(p, TOKEN_LBRACKET)) {
-        int line = p->current.line;
-        advance(p);
-        ASTNode *index = parse_expression(p);
-        expect(p, TOKEN_RBRACKET, "expected ']' after index expression");
-        ASTNode *n = ast_new(NODE_INDEX, line);
-        n->as.index_expr.array = node;
-        n->as.index_expr.index = index;
-        node = n;
+    for (;;) {
+        if (check(p, TOKEN_LBRACKET)) {
+            int line = p->current.line;
+            advance(p);
+            ASTNode *index = parse_expression(p);
+            expect(p, TOKEN_RBRACKET, "expected ']' after index expression");
+            ASTNode *n = ast_new(NODE_INDEX, line);
+            n->as.index_expr.array = node;
+            n->as.index_expr.index = index;
+            node = n;
+        } else if (check(p, TOKEN_LPAREN)) {
+            /* Function call */
+            int line = p->current.line;
+            advance(p);
+            ASTNode *n = ast_new(NODE_CALL, line);
+            n->as.call.callee = node;
+            nodelist_init(&n->as.call.args);
+            if (!check(p, TOKEN_RPAREN)) {
+                do {
+                    nodelist_push(&n->as.call.args, parse_expression(p));
+                } while (match(p, TOKEN_COMMA));
+            }
+            expect(p, TOKEN_RPAREN, "expected ')' after call arguments");
+            node = n;
+        } else if (check(p, TOKEN_DOT)) {
+            int line = p->current.line;
+            advance(p);
+            if (!check(p, TOKEN_IDENTIFIER)) {
+                error_at(p, p->current, "expected member name after '.'");
+                expect(p, TOKEN_IDENTIFIER, "expected identifier");
+            }
+            /* Build a MODULE_REF wrapping the current node */
+            ASTNode *n = ast_new(NODE_MODULE_REF, line);
+            /* Extract the left side's name - either an identifier or nested module ref */
+            if (node->type == NODE_IDENTIFIER) {
+                n->as.module_ref.module = node->as.identifier.name;
+                n->as.module_ref.member = token_text(p->current);
+            } else if (node->type == NODE_MODULE_REF) {
+                /* e.g., a.b.c - flatten to module="a.b", member="c" */
+                size_t mlen = strlen(node->as.module_ref.module) + 1 + strlen(node->as.module_ref.member);
+                char *combined = malloc(mlen + 1);
+                snprintf(combined, mlen + 1, "%s.%s", node->as.module_ref.module, node->as.module_ref.member);
+                n->as.module_ref.module = combined;
+                n->as.module_ref.member = token_text(p->current);
+            } else {
+                error_at(p, p->current, "invalid left side of '.'");
+                n->as.module_ref.module = strdup("?");
+                n->as.module_ref.member = token_text(p->current);
+            }
+            advance(p);
+            node = n;
+        } else {
+            break;
+        }
     }
     return node;
 }
@@ -262,7 +283,7 @@ static ASTNode *parse_power(Parser *p) {
     if (check(p, TOKEN_POWER)) {
         int line = p->current.line;
         advance(p);
-        ASTNode *right = parse_unary(p); /* right-assoc; allows `2 ** -2` */
+        ASTNode *right = parse_unary(p);
         return make_binary(TOKEN_POWER, left, right, line);
     }
     return left;
@@ -360,7 +381,7 @@ static ASTNode *parse_not(Parser *p) {
     if (check(p, TOKEN_NOT)) {
         int line = p->current.line;
         advance(p);
-        ASTNode *operand = parse_not(p); /* right-assoc */
+        ASTNode *operand = parse_not(p);
         ASTNode *n = ast_new(NODE_UNARY, line);
         n->as.unary.op = TOKEN_NOT;
         n->as.unary.operand = operand;
@@ -408,7 +429,7 @@ static ASTNode *parse_assignment(Parser *p) {
             error_at(p, p->current, "invalid assignment target");
         }
         advance(p);
-        ASTNode *value = parse_assignment(p); /* right-assoc */
+        ASTNode *value = parse_assignment(p);
         ASTNode *n = ast_new(NODE_ASSIGN, line);
         n->as.assign.op = op;
         n->as.assign.target = left;
@@ -423,32 +444,54 @@ static ASTNode *parse_expression(Parser *p) {
 }
 
 /* ---------------------------------------------------------------------
+ * JOB parameter list: TYPE IDENTIFIER [TYPE IDENTIFIER ...]
+ * No commas, no parentheses around the param list.
+ * ------------------------------------------------------------------- */
+static JobParam *parse_job_params(Parser *p, int *out_count) {
+    JobParam *params = NULL;
+    int count = 0;
+    int cap = 0;
+
+    while (is_type_keyword(p->current.type)) {
+        if (count == cap) {
+            cap = cap ? cap * 2 : 4;
+            params = realloc(params, sizeof(JobParam) * cap);
+        }
+        params[count].var_type = p->current.type;
+        advance(p);
+        if (!check(p, TOKEN_IDENTIFIER)) {
+            error_at(p, p->current, "expected parameter name after type");
+            advance(p);
+        }
+        params[count].name = token_text(p->current);
+        advance(p);
+        count++;
+    }
+    *out_count = count;
+    return params;
+}
+
+/* ---------------------------------------------------------------------
  * Statements
  * ------------------------------------------------------------------- */
 
-static int type_starts_var_decl(VOTokenType t) {
-    return t == TOKEN_TYPE_NUM || t == TOKEN_TYPE_DEC || t == TOKEN_TYPE_TEX ||
-           t == TOKEN_TYPE_YN  || t == TOKEN_TYPE_COLL;
-}
-
-static ASTNode *parse_var_or_const_decl(Parser *p, int is_const) {
+static ASTNode *parse_var_decl(Parser *p) {
     int line = p->current.line;
-    advance(p); /* VAR or CONST */
+    advance(p); /* VAR */
 
-    if (!type_starts_var_decl(p->current.type)) {
-        error_at(p, p->current, "expected a type (NUM/DEC/TEX/YN/COLL)");
+    if (!is_type_keyword(p->current.type)) {
+        error_at(p, p->current, "expected a type (NUM/DEC/TEX/YN/COLL/EMP)");
     }
     VOTokenType var_type = p->current.type;
     advance(p);
 
     Token name_tok = p->current;
     expect(p, TOKEN_IDENTIFIER, "expected an identifier in declaration");
-
     expect(p, TOKEN_EAQ, "expected EAQ in declaration");
 
     ASTNode *init = parse_expression(p);
 
-    ASTNode *n = ast_new(is_const ? NODE_CONST_DECL : NODE_VAR_DECL, line);
+    ASTNode *n = ast_new(NODE_VAR_DECL, line);
     n->as.var_decl.var_type = var_type;
     n->as.var_decl.name = token_text(name_tok);
     n->as.var_decl.init = init;
@@ -457,12 +500,36 @@ static ASTNode *parse_var_or_const_decl(Parser *p, int is_const) {
     return n;
 }
 
-/* Identifier/VMA-led statement: assignment, compound assignment, or
-   increment/decrement. (Bare expression statements otherwise are not
-   part of the grammar - Virtual Order statements are all keyword-led except
-   these two forms.) */
+static ASTNode *parse_hard_decl(Parser *p) {
+    int line = p->current.line;
+    advance(p); /* HARD */
+
+    if (!is_type_keyword(p->current.type)) {
+        error_at(p, p->current, "expected a type (NUM/DEC/TEX/YN/COLL/EMP)");
+    }
+    VOTokenType var_type = p->current.type;
+    advance(p);
+
+    Token name_tok = p->current;
+    expect(p, TOKEN_IDENTIFIER, "expected a name in HARD declaration");
+
+    expect(p, TOKEN_ASSIGN, "expected '=' in HARD declaration");
+
+    ASTNode *value = parse_expression(p);
+
+    ASTNode *n = ast_new(NODE_HARD_DECL, line);
+    n->as.hard_decl.var_type = var_type;
+    n->as.hard_decl.name = token_text(name_tok);
+    n->as.hard_decl.value = value;
+
+    expect_statement_end(p);
+    return n;
+}
+
+/* Identifier/VMA/module-led statement: assignment, compound assignment,
+   increment/decrement, or expression statement (function call). */
 static ASTNode *parse_assignment_or_incdec_statement(Parser *p) {
-    ASTNode *target = parse_postfix(p); /* identifier / VMA / indexed target */
+    ASTNode *target = parse_postfix(p);
     int line = p->current.line;
 
     if (check(p, TOKEN_INCREMENT) || check(p, TOKEN_DECREMENT)) {
@@ -496,6 +563,14 @@ static ASTNode *parse_assignment_or_incdec_statement(Parser *p) {
         return stmt;
     }
 
+    /* If the postfix already produced a call expression, use it as an expr stmt */
+    if (target->type == NODE_CALL || target->type == NODE_MODULE_REF) {
+        ASTNode *stmt = ast_new(NODE_EXPR_STMT, line);
+        stmt->as.expr_stmt.expr = target;
+        expect_statement_end(p);
+        return stmt;
+    }
+
     error_at(p, p->current, "expected '=', a compound assignment, or '++'/'--' after this");
     expect_statement_end(p);
     ASTNode *stmt = ast_new(NODE_EXPR_STMT, line);
@@ -505,7 +580,7 @@ static ASTNode *parse_assignment_or_incdec_statement(Parser *p) {
 
 static ASTNode *parse_show_stmt(Parser *p) {
     int line = p->current.line;
-    advance(p); /* SHOW */
+    advance(p);
     ASTNode *expr = parse_expression(p);
     ASTNode *n = ast_new(NODE_SHOW_STMT, line);
     n->as.show_stmt.expr = expr;
@@ -515,7 +590,7 @@ static ASTNode *parse_show_stmt(Parser *p) {
 
 static ASTNode *parse_store_stmt(Parser *p) {
     int line = p->current.line;
-    advance(p); /* STORE */
+    advance(p);
     ASTNode *value = parse_expression(p);
     Token vma_tok = p->current;
     expect(p, TOKEN_VMA, "expected a VMA as the STORE target");
@@ -528,7 +603,7 @@ static ASTNode *parse_store_stmt(Parser *p) {
 
 static ASTNode *parse_clean_stmt(Parser *p) {
     int line = p->current.line;
-    advance(p); /* CLEAN */
+    advance(p);
     Token target_tok = p->current;
     if (!check(p, TOKEN_VMA) && !check(p, TOKEN_IDENTIFIER)) {
         error_at(p, p->current, "expected a VMA or identifier after CLEAN");
@@ -542,7 +617,7 @@ static ASTNode *parse_clean_stmt(Parser *p) {
 
 static ASTNode *parse_cleanall_stmt(Parser *p) {
     int line = p->current.line;
-    advance(p); /* CLEANALL */
+    advance(p);
     ASTNode *n = ast_new(NODE_CLEANALL_STMT, line);
     expect_statement_end(p);
     return n;
@@ -550,7 +625,7 @@ static ASTNode *parse_cleanall_stmt(Parser *p) {
 
 static ASTNode *parse_autoclean_stmt(Parser *p) {
     int line = p->current.line;
-    advance(p); /* AUTOCLEAN */
+    advance(p);
     int on;
     if (match(p, TOKEN_ON)) on = 1;
     else if (match(p, TOKEN_OFF)) on = 0;
@@ -563,7 +638,7 @@ static ASTNode *parse_autoclean_stmt(Parser *p) {
 
 static ASTNode *parse_goto_stmt(Parser *p) {
     int line = p->current.line;
-    advance(p); /* GOTO */
+    advance(p);
     Token label_tok = p->current;
     expect(p, TOKEN_IDENTIFIER, "expected a label name after GOTO");
     ASTNode *n = ast_new(NODE_GOTO_STMT, line);
@@ -583,6 +658,153 @@ static ASTNode *parse_label_stmt(Parser *p) {
     return n;
 }
 
+static ASTNode *parse_job_decl(Parser *p) {
+    int line = p->current.line;
+    advance(p); /* JOB */
+
+    Token name_tok = p->current;
+    expect(p, TOKEN_IDENTIFIER, "expected a job name after JOB");
+
+    int param_count = 0;
+    JobParam *params = parse_job_params(p, &param_count);
+
+    expect_statement_end(p);
+
+    const VOTokenType terms[] = { TOKEN_ENDJOB };
+    ASTNode *body = parse_block_until(p, terms, 1);
+    expect(p, TOKEN_ENDJOB, "expected ENDJOB to close job");
+    expect_statement_end(p);
+
+    ASTNode *n = ast_new(NODE_JOB_DECL, line);
+    n->as.job_decl.name = token_text(name_tok);
+    n->as.job_decl.params = params;
+    n->as.job_decl.param_count = param_count;
+    n->as.job_decl.body = body;
+    return n;
+}
+
+static ASTNode *parse_give_stmt(Parser *p) {
+    int line = p->current.line;
+    advance(p); /* GIVE */
+    ASTNode *value = parse_expression(p);
+    ASTNode *n = ast_new(NODE_GIVE_STMT, line);
+    n->as.give_stmt.value = value;
+    expect_statement_end(p);
+    return n;
+}
+
+static ASTNode *parse_demand_stmt(Parser *p) {
+    int line = p->current.line;
+    advance(p); /* DEMAND */
+    ASTNode *condition = parse_expression(p);
+    char *message = NULL;
+    if (check(p, TOKEN_TEX_LITERAL)) {
+        /* Grab the message string */
+        char *raw = token_text(p->current);
+        int len = (int)strlen(raw);
+        message = malloc(len - 1);
+        memcpy(message, raw + 1, len - 2);
+        message[len - 2] = '\0';
+        free(raw);
+        advance(p);
+    }
+    ASTNode *n = ast_new(NODE_DEMAND_STMT, line);
+    n->as.demand_stmt.condition = condition;
+    n->as.demand_stmt.message = message;
+    expect_statement_end(p);
+    return n;
+}
+
+static ASTNode *parse_serve_stmt(Parser *p) {
+    int line = p->current.line;
+    advance(p); /* SERVE */
+    ASTNode *value = parse_expression(p);
+    ASTNode *n = ast_new(NODE_SERVE_STMT, line);
+    n->as.serve_stmt.value = value;
+    expect_statement_end(p);
+    return n;
+}
+
+static ASTNode *parse_do_stmt(Parser *p) {
+    int line = p->current.line;
+    advance(p); /* DO */
+    expect_statement_end(p);
+
+    const VOTokenType try_terms[] = { TOKEN_GRABE };
+    ASTNode *try_block = parse_block_until(p, try_terms, 1);
+
+    expect(p, TOKEN_GRABE, "expected GRABE after DO block");
+    expect_statement_end(p);
+
+    const VOTokenType catch_terms[] = { TOKEN_ENDDO };
+    ASTNode *catch_block = parse_block_until(p, catch_terms, 1);
+
+    expect(p, TOKEN_ENDDO, "expected ENDDO to close DO/GRABE");
+    expect_statement_end(p);
+
+    ASTNode *n = ast_new(NODE_DO_STMT, line);
+    n->as.do_stmt.try_block = try_block;
+    n->as.do_stmt.catch_block = catch_block;
+    return n;
+}
+
+static ASTNode *parse_bring_stmt(Parser *p) {
+    int line = p->current.line;
+    advance(p); /* BRING */
+
+    /* Collect everything from here to end of line as a raw path.
+       The path may be tokenized as IDENTifiers, DOTs, SLASHes, etc. */
+    char path_buf[1024];
+    int pos = 0;
+
+    while (!check(p, TOKEN_NEWLINE) && !check(p, TOKEN_EOF)) {
+        /* Copy the token text */
+        for (int i = 0; i < p->current.length && pos < (int)sizeof(path_buf) - 1; i++)
+            path_buf[pos++] = p->current.start[i];
+        advance(p);
+    }
+    path_buf[pos] = '\0';
+
+    /* Trim trailing whitespace */
+    while (pos > 0 && (path_buf[pos-1] == ' ' || path_buf[pos-1] == '\t'))
+        path_buf[--pos] = '\0';
+
+    ASTNode *n = ast_new(NODE_BRING_STMT, line);
+    n->as.bring_stmt.path = strdup(path_buf);
+    expect_statement_end(p);
+    return n;
+}
+
+static ASTNode *parse_ship_stmt(Parser *p) {
+    int line = p->current.line;
+    advance(p); /* SHIP */
+    Token name_tok = p->current;
+    expect(p, TOKEN_IDENTIFIER, "expected a member name after SHIP");
+    ASTNode *n = ast_new(NODE_SHIP_STMT, line);
+    n->as.ship_stmt.name = token_text(name_tok);
+    expect_statement_end(p);
+    return n;
+}
+
+static ASTNode *parse_peice_decl(Parser *p) {
+    int line = p->current.line;
+    advance(p); /* PEICE */
+
+    Token name_tok = p->current;
+    expect(p, TOKEN_IDENTIFIER, "expected a piece name after PEICE");
+    expect_statement_end(p);
+
+    const VOTokenType terms[] = { TOKEN_ENDPEICE };
+    ASTNode *body = parse_block_until(p, terms, 1);
+    expect(p, TOKEN_ENDPEICE, "expected ENDPEICE");
+    expect_statement_end(p);
+
+    ASTNode *n = ast_new(NODE_PEICE_DECL, line);
+    n->as.peice_decl.name = token_text(name_tok);
+    n->as.peice_decl.body = body;
+    return n;
+}
+
 static ASTNode *parse_if_branch(Parser *p, ASTNode *condition, const VOTokenType *terms, int n_terms) {
     int line = p->current.line;
     ASTNode *block = parse_block_until(p, terms, n_terms);
@@ -592,10 +814,6 @@ static ASTNode *parse_if_branch(Parser *p, ASTNode *condition, const VOTokenType
     return branch;
 }
 
-/* Handles both:
- *   IF cond ... (ORIF cond ...)* (IFNOT [cond] ...)? ENDIF
- *   IFNOT cond ... (ORIF cond ...)* (IFNOT [cond] ...)? ENDIF   (== IF NOT cond ...)
- */
 static ASTNode *parse_conditional(Parser *p, int negate_condition) {
     int line = p->current.line;
     advance(p); /* IF or IFNOT */
@@ -633,8 +851,6 @@ static ASTNode *parse_conditional(Parser *p, int negate_condition) {
         advance(p);
         ASTNode *cond = NULL;
         if (!check(p, TOKEN_NEWLINE)) {
-            /* IFNOT with a trailing condition here reads as another
-               conditional branch (== ORIF NOT cond), not just else. */
             ASTNode *raw = parse_expression(p);
             cond = ast_new(NODE_UNARY, bline);
             cond->as.unary.op = TOKEN_NOT;
@@ -644,7 +860,7 @@ static ASTNode *parse_conditional(Parser *p, int negate_condition) {
         VOTokenType only_endif[] = { TOKEN_ENDIF };
         ASTNode *block = parse_block_until(p, only_endif, 1);
         ASTNode *branch = ast_new(NODE_IF_BRANCH, bline);
-        branch->as.if_branch.condition = cond; /* NULL => plain else */
+        branch->as.if_branch.condition = cond;
         branch->as.if_branch.block = block;
         nodelist_push(&if_stmt->as.if_stmt.branches, branch);
     }
@@ -656,7 +872,7 @@ static ASTNode *parse_conditional(Parser *p, int negate_condition) {
 
 static ASTNode *parse_while_stmt(Parser *p) {
     int line = p->current.line;
-    advance(p); /* WHILE */
+    advance(p);
     ASTNode *condition = parse_expression(p);
     expect_statement_end(p);
     VOTokenType terms[] = { TOKEN_ENDWHILE };
@@ -672,7 +888,7 @@ static ASTNode *parse_while_stmt(Parser *p) {
 
 static ASTNode *parse_for_stmt(Parser *p) {
     int line = p->current.line;
-    advance(p); /* FOR */
+    advance(p);
     Token iter_tok = p->current;
     expect(p, TOKEN_IDENTIFIER, "expected loop variable name after FOR");
     expect(p, TOKEN_ASSIGN, "expected '=' after FOR loop variable");
@@ -695,7 +911,7 @@ static ASTNode *parse_for_stmt(Parser *p) {
 
 static ASTNode *parse_when_stmt(Parser *p) {
     int line = p->current.line;
-    advance(p); /* WHEN */
+    advance(p);
 
     ASTNode *n = ast_new(NODE_WHEN_STMT, line);
 
@@ -705,8 +921,8 @@ static ASTNode *parse_when_stmt(Parser *p) {
         n->as.when_stmt.kind = WHEN_PROGRAM_START;
     } else if (check(p, TOKEN_VMA) && p->next.type == TOKEN_CHANGED) {
         Token vma_tok = p->current;
-        advance(p); /* VMA */
-        advance(p); /* CHANGED */
+        advance(p);
+        advance(p);
         n->as.when_stmt.kind = WHEN_VMA_CHANGED;
         n->as.when_stmt.vma_name = token_text(vma_tok);
     } else {
@@ -724,8 +940,8 @@ static ASTNode *parse_when_stmt(Parser *p) {
 
 static ASTNode *parse_statement(Parser *p) {
     switch (p->current.type) {
-        case TOKEN_VAR:       return parse_var_or_const_decl(p, 0);
-        case TOKEN_CONST:     return parse_var_or_const_decl(p, 1);
+        case TOKEN_VAR:       return parse_var_decl(p);
+        case TOKEN_HARD:      return parse_hard_decl(p);
         case TOKEN_SHOW:      return parse_show_stmt(p);
         case TOKEN_STORE:     return parse_store_stmt(p);
         case TOKEN_CLEAN:     return parse_clean_stmt(p);
@@ -736,12 +952,16 @@ static ASTNode *parse_statement(Parser *p) {
         case TOKEN_WHILE:     return parse_while_stmt(p);
         case TOKEN_FOR:       return parse_for_stmt(p);
         case TOKEN_WHEN:      return parse_when_stmt(p);
+        case TOKEN_JOB:       return parse_job_decl(p);
+        case TOKEN_GIVE:      return parse_give_stmt(p);
+        case TOKEN_DEMAND:    return parse_demand_stmt(p);
+        case TOKEN_SERVE:     return parse_serve_stmt(p);
+        case TOKEN_DO:        return parse_do_stmt(p);
+        case TOKEN_BRING:     return parse_bring_stmt(p);
+        case TOKEN_SHIP:      return parse_ship_stmt(p);
+        case TOKEN_PEICE:     return parse_peice_decl(p);
 
         case TOKEN_IFNOT:
-            /* IFNOT with a condition on its own is IF-NOT shorthand;
-               bare IFNOT can only appear as an else-branch inside an
-               existing chain, which parse_conditional's caller context
-               (not parse_statement) is responsible for reaching. */
             if (p->next.type == TOKEN_NEWLINE) {
                 error_at(p, p->current,
                           "bare IFNOT (else-branch) may only appear inside an IF...ENDIF chain");
@@ -782,8 +1002,6 @@ static ASTNode *parse_block_until(Parser *p, const VOTokenType *terminators, int
         skip_newlines(p);
 
         if (p->had_error) {
-            /* best-effort recovery: bail out of this block rather than
-               looping forever if something is badly malformed */
             break;
         }
     }

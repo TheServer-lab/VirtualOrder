@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int rc = run_program(program);
+    int rc = run_program(program, argv[1]);
     free(source);
     return rc;
 }

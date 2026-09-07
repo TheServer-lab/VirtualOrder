@@ -10,7 +10,8 @@ typedef enum { CG_TARGET_LINUX, CG_TARGET_WINDOWS } CgTarget;
    assembly assumes it will be assembled+linked together with vo_rt.c
    (compiled for the same target). Returns 0 on success, 1 if the
    program uses a construct this backend doesn't yet lower to native
-   code (diagnostics go to stderr). */
-int codegen_compile(ASTNode *program, CgTarget target, FILE *out);
+   code (diagnostics go to stderr). source_dir is the directory of the
+   main source file, used for resolving BRING paths. */
+int codegen_compile(ASTNode *program, CgTarget target, const char *source_dir, FILE *out);
 
 #endif

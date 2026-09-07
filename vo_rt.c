@@ -17,6 +17,7 @@ void vo_set_dec(VoValue *v, double d)    { v->type = VO_DEC;  v->dec = d; }
 void vo_set_tex(VoValue *v, const char *s) { v->type = VO_TEX; v->tex = strdup(s ? s : ""); }
 void vo_set_yn(VoValue *v, int b)        { v->type = VO_YN;   v->yn = b ? 1 : 0; }
 void vo_set_null(VoValue *v)             { memset(v, 0, sizeof(*v)); v->type = VO_NULL; }
+void vo_set_emp(VoValue *v)              { memset(v, 0, sizeof(*v)); v->type = VO_EMP; }
 void vo_set_dec_from_ptr(VoValue *v, const double *d) { v->type = VO_DEC; v->dec = *d; }
 void vo_coll_new(VoValue *v)             { memset(v, 0, sizeof(*v)); v->type = VO_COLL; }
 
@@ -61,6 +62,7 @@ static char *to_cstr(VoValue *v) {
         case VO_TEX: return strdup(v->tex ? v->tex : "");
         case VO_YN:  return strdup(v->yn ? "YES" : "NO");
         case VO_NULL: return strdup("NULL");
+        case VO_EMP: return strdup("EMP");
         case VO_COLL: {
             size_t cap = 64, len = 1;
             char *out = malloc(cap);
@@ -96,6 +98,7 @@ int vo_truthy(VoValue *v) {
         case VO_YN:  return v->yn != 0;
         case VO_COLL: return v->count != 0;
         case VO_NULL: return 0;
+        case VO_EMP: return 0;
     }
     return 0;
 }
@@ -107,6 +110,7 @@ static int values_equal(VoValue *a, VoValue *b) {
         case VO_TEX: return strcmp(a->tex ? a->tex : "", b->tex ? b->tex : "") == 0;
         case VO_YN:  return a->yn == b->yn;
         case VO_NULL: return 1;
+        case VO_EMP: return 1;
         case VO_COLL:
             if (a->count != b->count) return 0;
             for (int i = 0; i < a->count; i++) if (!values_equal(&a->items[i], &b->items[i])) return 0;
@@ -268,6 +272,11 @@ void vo_plus_assign(VoValue *dst, VoValue *current, VoValue *rhs, int line) {
         return;
     }
     vo_add(dst, current, rhs, line);
+}
+
+int vo_demand_check(VoValue *cond, int line) {
+    (void)line;
+    return vo_truthy(cond);
 }
 
 void vo_rt_init(void) { setvbuf(stdout, NULL, _IOLBF, 0); }

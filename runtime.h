@@ -30,6 +30,6 @@
  * runtime error (e.g. undeclared-VMA access, event queue overflow)
  * stopped execution early.
  * ------------------------------------------------------------------- */
-int run_program(ASTNode *program);
+int run_program(ASTNode *program, const char *source_path);
 
 #endif

@@ -5,6 +5,8 @@
 #include "codegen.h"
 #include "vo_rt.h"
 #include "memstream_compat.h"
+#include "parser.h"
+#include "ast.h"
 
 /* =========================================================================
  * codegen.c - AST -> real x86-64 machine instructions.
@@ -135,14 +137,56 @@ static CSym *scope_declare(CScope *s, const char *name) {
 }
 
 /* ---- the code generator state ------------------------------------------ */
+
+/* v1.3 jobs: each JOB becomes its own emitted function. */
 typedef struct {
-    FILE *body;          /* memstream: function body instructions        */
+    ASTNode *decl;          /* the NODE_JOB_DECL */
+    int id;
+    int param_count;
+    char param_labels[16][40]; /* .bss slot for each parameter */
+    char ret_label[40];        /* .bss slot holding the job's return value */
+    char *name;              /* lookup key: plain "ADD" for top-level jobs,
+                                 "math#ADD" for jobs declared inside a PEICE -
+                                 keeps module jobs from colliding with each
+                                 other or with top-level jobs of the same name */
+    char *module_name;       /* owning module's name, or NULL for top-level jobs */
+} CJob;
+
+/* ---- module system (native compiler) ------------------------------------ */
+typedef enum { CG_MOD_MEMBER_JOB, CG_MOD_MEMBER_VAR } CgModMemberKind;
+
+typedef struct {
+    char *name;                /* exported name (e.g., "ADD") */
+    CgModMemberKind kind;      /* job or variable */
+    char *job_internal;        /* for jobs: internal job name (e.g., "math#ADD") */
+    char var_label[40];        /* for vars: .bss slot label */
+    int is_exported;           /* SHIPped? */
+} CgModMember;
+
+typedef struct {
+    char *name;                /* module name (e.g., "math") */
+    CgModMember *members; int member_count, member_cap;
+    int loaded;                /* 1 if fully loaded */
+    int loading;               /* 1 if currently being loaded (for cycle detection) */
+    ASTNode *peice_ast;        /* the PEICE_DECL node for this module (for compilation) */
+} CgModule;
+
+/* nested DO/GRABE contexts for lowering SERVE/DEMAND branches */
+
+/* nested DO/GRABE contexts for lowering SERVE/DEMAND branches */
+typedef struct {
+    const char *flag_label;    /* .bss VoValue flag test field (yn at +8) */
+    int end_label;             /* jump here on issue (end of try block) */
+} CDo;
+
+typedef struct {
+    FILE *body;          /* memstream: current function body instructions */
     char *body_buf; size_t body_len;
     FILE *rodata;         /* memstream: string literal constants          */
     char *rodata_buf; size_t rodata_len;
     CgTarget target;
     ABI abi;
-    int depth, max_depth; /* expr temp-slot stack (LIFO)                   */
+    int depth, max_depth; /* expr temp-slot stack (LIFO) - current function */
     int label_id;
     int str_id;
     int for_id;
@@ -151,12 +195,237 @@ typedef struct {
     GVma *globals; int gcount, gcap;
     int had_error;
     int autoclean_on;
+
+    CJob *jobs; int job_count, job_cap;
+    int cur_job_id;             /* -1 => top-level vo_main body */
+    const char *cur_job_ret;    /* return .bss label for the job being emitted */
+    const char *cur_job_module; /* owning module name while emitting a module job's body, else NULL */
+
+    /* Module system (native) */
+    CgModule *modules; int module_count, module_cap;
+    const char *source_dir;     /* directory of main source for BRING resolution */
+
+    CDo *do_stack; int do_depth, do_cap;
 } CG;
 
 static void cg_error(CG *cg, int line, const char *msg) {
     fprintf(stderr, "[line %d] Compile error: %s\n", line, msg);
     cg->had_error = 1;
 }
+
+/* ---- job registry (name -> CJob) ---- */
+static CJob *cg_job_lookup(CG *cg, const char *name) {
+    for (int i = 0; i < cg->job_count; i++) {
+        if (cg->jobs[i].name && strcmp(cg->jobs[i].name, name) == 0) return &cg->jobs[i];
+    }
+    return NULL;
+}
+
+/* `lookup_name` is the key emit_call_expr will find this job under - plain
+   job name for top-level jobs, "module#job" for jobs declared inside a
+   PEICE (see cg_job_lookup callers). `module_name` is NULL for top-level
+   jobs, else the owning module's name (used to resolve unqualified calls
+   made from inside that same module - see emit_call_expr). */
+static CJob *cg_job_add(CG *cg, ASTNode *decl, int id, const char *lookup_name, const char *module_name) {
+    if (cg_job_lookup(cg, lookup_name)) return NULL; /* dup - analyzer catches for top-level */
+    if (cg->job_count == cg->job_cap) {
+        cg->job_cap = cg->job_cap ? cg->job_cap * 2 : 8;
+        cg->jobs = realloc(cg->jobs, sizeof(CJob) * cg->job_cap);
+    }
+    CJob *j = &cg->jobs[cg->job_count++];
+    j->decl = decl;
+    j->id = id;
+    j->name = strdup(lookup_name);
+    j->module_name = module_name ? strdup(module_name) : NULL;
+    return j;
+}
+
+/* ---- module system helpers (native) ---- */
+static CgModule *cg_module_find(CG *cg, const char *name) {
+    for (int i = 0; i < cg->module_count; i++)
+        if (strcmp(cg->modules[i].name, name) == 0)
+            return &cg->modules[i];
+    return NULL;
+}
+
+static CgModule *cg_module_ensure(CG *cg, const char *name) {
+    CgModule *m = cg_module_find(cg, name);
+    if (m) return m;
+    if (cg->module_count == cg->module_cap) {
+        cg->module_cap = cg->module_cap ? cg->module_cap * 2 : 8;
+        cg->modules = realloc(cg->modules, sizeof(CgModule) * cg->module_cap);
+    }
+    CgModule *nm = &cg->modules[cg->module_count++];
+    memset(nm, 0, sizeof(CgModule));
+    nm->name = strdup(name);
+    return nm;
+}
+
+static CgModMember *cg_module_member_find(CgModule *mod, const char *name) {
+    for (int i = 0; i < mod->member_count; i++)
+        if (strcmp(mod->members[i].name, name) == 0)
+            return &mod->members[i];
+    return NULL;
+}
+
+static CgModMember *cg_module_member_add(CgModule *mod, const char *name, CgModMemberKind kind) {
+    if (mod->member_count == mod->member_cap) {
+        mod->member_cap = mod->member_cap ? mod->member_cap * 2 : 8;
+        mod->members = realloc(mod->members, sizeof(CgModMember) * mod->member_cap);
+    }
+    CgModMember *mm = &mod->members[mod->member_count++];
+    memset(mm, 0, sizeof(CgModMember));
+    mm->name = strdup(name);
+    mm->kind = kind;
+    return mm;
+}
+
+/* Load a module from a .vo file at the given path, relative to base_dir.
+   Returns 0 on success, 1 on error (error reported via cg_error). */
+static int cg_module_load(CG *cg, const char *path, const char *base_dir) {
+    char errbuf[256];
+    /* Resolve full path */
+    char full_path[4096];
+    if (path[0] == '/' || (path[0] && path[1] == ':')) {
+        snprintf(full_path, sizeof(full_path), "%s", path);
+    } else {
+        snprintf(full_path, sizeof(full_path), "%s/%s", base_dir, path);
+    }
+
+    /* Read file */
+    FILE *f = fopen(full_path, "rb");
+    if (!f) {
+        snprintf(errbuf, sizeof(errbuf), "module file not found: %s", full_path);
+        cg_error(cg, 0, errbuf);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *source = malloc(size + 1);
+    if (fread(source, 1, size, f) != (size_t)size) { free(source); fclose(f); snprintf(errbuf, sizeof(errbuf), "failed to read module: %s", full_path); cg_error(cg, 0, errbuf); return 1; }
+    source[size] = '\0';
+    fclose(f);
+
+    /* Parse */
+    Parser parser;
+    parser_init(&parser, source);
+    ASTNode *prog = parser_parse_program(&parser);
+    if (parser.had_error) {
+        free(source);
+        cg_error(cg, 0, "module parse errors");
+        return 1;
+    }
+
+    /* Verify top-level is a single PEICE_DECL. parser_parse_program() wraps
+       a whole file's statements in NODE_PROGRAM (not NODE_BLOCK) - both
+       use the same `as.block.statements` layout, so accept either. */
+    if ((prog->type != NODE_BLOCK && prog->type != NODE_PROGRAM) ||
+        prog->as.block.statements.count != 1 ||
+        prog->as.block.statements.items[0]->type != NODE_PEICE_DECL) {
+        free(source);
+        ast_free(prog);
+        cg_error(cg, 0, "module must contain exactly one PEICE declaration");
+        return 1;
+    }
+    ASTNode *peice = prog->as.block.statements.items[0];
+    const char *peice_name = peice->as.peice_decl.name;
+
+    /* Check module already loaded */
+    CgModule *mod = cg_module_find(cg, peice_name);
+    if (mod) {
+        if (mod->loading) {
+            free(source);
+            ast_free(prog);
+            snprintf(errbuf, sizeof(errbuf), "circular module dependency: %s", peice_name);
+            cg_error(cg, 0, errbuf);
+            return 1;
+        }
+        if (mod->loaded) {
+            free(source);
+            ast_free(prog);
+            return 0; /* already loaded */
+        }
+    } else {
+        mod = cg_module_ensure(cg, peice_name);
+    }
+    mod->loading = 1;
+    mod->peice_ast = peice;  /* store for later compilation */
+
+    /* Recursively load nested BRINGs in the PEICE body */
+    ASTNode *body = peice->as.peice_decl.body;
+    for (int i = 0; i < body->as.block.statements.count; i++) {
+        ASTNode *stmt = body->as.block.statements.items[i];
+        if (stmt->type == NODE_BRING_STMT) {
+            const char *mod_dir = full_path;
+            char *slash = strrchr(full_path, '/');
+            if (slash) {
+                mod_dir = full_path;
+                *slash = '\0';
+                if (cg_module_load(cg, stmt->as.bring_stmt.path, mod_dir)) {
+                    *slash = '/';
+                    mod->loading = 0;
+                    free(source);
+                    ast_free(prog);
+                    return 1;
+                }
+                *slash = '/';
+            } else {
+                if (cg_module_load(cg, stmt->as.bring_stmt.path, base_dir)) {
+                    mod->loading = 0;
+                    free(source);
+                    ast_free(prog);
+                    return 1;
+                }
+            }
+        }
+    }
+
+    /* Collect SHIPped members from the PEICE */
+    for (int i = 0; i < body->as.block.statements.count; i++) {
+        ASTNode *stmt = body->as.block.statements.items[i];
+        if (stmt->type == NODE_SHIP_STMT) {
+            const char *ship_name = stmt->as.ship_stmt.name;
+            /* Check if it's a job or variable declaration */
+            int is_job = 0;
+            for (int j = 0; j < body->as.block.statements.count; j++) {
+                ASTNode *other = body->as.block.statements.items[j];
+                if (other->type == NODE_JOB_DECL && strcmp(other->as.job_decl.name, ship_name) == 0) {
+                    is_job = 1;
+                    break;
+                }
+                if ((other->type == NODE_VAR_DECL || other->type == NODE_HARD_DECL) &&
+                    strcmp(other->as.hard_decl.name, ship_name) == 0) {
+                    is_job = 0;
+                    break;
+                }
+            }
+            CgModMemberKind kind = is_job ? CG_MOD_MEMBER_JOB : CG_MOD_MEMBER_VAR;
+            CgModMember *mm = cg_module_member_add(mod, ship_name, kind);
+            mm->is_exported = 1;
+        }
+    }
+
+    mod->loaded = 1;
+    mod->loading = 0;
+    free(source);
+    /* Do NOT ast_free(prog) - we need the PEICE AST for compilation later */
+    return 0;
+}
+
+static void cg_do_push(CG *cg, const char *flag_label, int end_label) {
+    if (cg->do_depth == cg->do_cap) {
+        cg->do_cap = cg->do_cap ? cg->do_cap * 2 : 4;
+        cg->do_stack = realloc(cg->do_stack, sizeof(CDo) * cg->do_cap);
+    }
+    cg->do_stack[cg->do_depth].flag_label = flag_label;
+    cg->do_stack[cg->do_depth].end_label = end_label;
+    cg->do_depth++;
+}
+static const CDo *cg_do_top(const CG *cg) {
+    return cg->do_depth > 0 ? &cg->do_stack[cg->do_depth - 1] : NULL;
+}
+static void cg_do_pop(CG *cg) { if (cg->do_depth > 0) cg->do_depth--; }
 
 /* ---- global VMA slot lookup/creation ---- */
 static const char *global_label_for_addr(CG *cg, const char *addr) {
@@ -228,6 +497,10 @@ static int new_label(CG *cg) { return cg->label_id++; }
 static Opnd emit_expr(CG *cg, ASTNode *node);
 static void emit_stmt(CG *cg, ASTNode *node);
 static void emit_block(CG *cg, ASTNode *block);
+static void emit_give_stmt(CG *cg, ASTNode *node);
+static void emit_demand_stmt(CG *cg, ASTNode *node);
+static void emit_serve_stmt(CG *cg, ASTNode *node);
+static void emit_do_stmt(CG *cg, ASTNode *node);
 
 /* ---- string literal constants ---- */
 static const char *intern_string(CG *cg, const char *s) {
@@ -242,6 +515,81 @@ static const char *intern_string(CG *cg, const char *s) {
     }
     fprintf(cg->rodata, "\"\n");
     return label; /* pointer to the static buffer above - copied out by caller immediately */
+}
+
+/* ---- JOB call expression ------------------------------------------------ */
+/* Arguments are copied into the callee job's dedicated global parameter
+   slots (mirrors the interpreter's VMA-backed param binding), then the job
+   function runs and leaves its result in its global return slot. */
+static Opnd emit_call_expr(CG *cg, ASTNode *node) {
+    ASTNode *callee = node->as.call.callee;
+    CJob *job = NULL;
+
+    if (callee->type == NODE_MODULE_REF) {
+        /* Module-member call: math.ADD(...) */
+        const char *mod_name = callee->as.module_ref.module;
+        const char *member_name = callee->as.module_ref.member;
+        CgModule *mod = cg_module_find(cg, mod_name);
+        if (!mod) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "unknown module '%s'", mod_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
+        CgModMember *mm = cg_module_member_find(mod, member_name);
+        if (!mm) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' has no member '%s'", mod_name, member_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
+        if (!mm->is_exported) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' member '%s' is not exported", mod_name, member_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
+        if (mm->kind != CG_MOD_MEMBER_JOB) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' member '%s' is not a job", mod_name, member_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
+        if (!mm->job_internal) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' job '%s' not found (internal error)", mod_name, member_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
+        job = cg_job_lookup(cg, mm->job_internal);
+        if (!job) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "internal job '%s' not found", mm->job_internal); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
+    } else if (callee->type == NODE_IDENTIFIER) {
+        /* Direct call. If we're compiling a job that belongs to a module,
+           prefer a sibling job in that same module first (so unqualified
+           calls between jobs declared in the same PEICE resolve without
+           needing self-qualification), then fall back to a top-level job
+           of the same name. */
+        const char *fname = callee->as.identifier.name;
+        job = NULL;
+        if (cg->cur_job_module) {
+            char qualified[128];
+            snprintf(qualified, sizeof(qualified), "%s#%s", cg->cur_job_module, fname);
+            job = cg_job_lookup(cg, qualified);
+        }
+        if (!job) job = cg_job_lookup(cg, fname);
+        if (!job) {
+            cg_error(cg, node->line, "call to unknown job (analyzer should have caught this)");
+            Opnd bad = alloc_temp(cg);
+            call1(cg, "vo_set_emp", bad.text);
+            return bad;
+        }
+    } else {
+        cg_error(cg, node->line, "only direct function calls are supported");
+        Opnd bad = alloc_temp(cg);
+        call1(cg, "vo_set_emp", bad.text);
+        return bad;
+    }
+
+    int nargs = node->as.call.args.count;
+    if (nargs != job->param_count) {
+        cg_error(cg, node->line, "wrong number of arguments (analyzer should have caught this)");
+        Opnd bad = alloc_temp(cg);
+        call1(cg, "vo_set_emp", bad.text);
+        return bad;
+    }
+
+    Opnd temps[16];
+    for (int i = 0; i < nargs; i++) temps[i] = emit_expr(cg, node->as.call.args.items[i]);
+
+    for (int i = 0; i < nargs; i++) {
+        char rip[48]; snprintf(rip, sizeof(rip), "%s(%%rip)", job->param_labels[i]);
+        call2(cg, "vo_assign", rip, temps[i].text);
+        free_if_temp(cg, &temps[i]);
+    }
+
+    char retrip[48]; snprintf(retrip, sizeof(retrip), "%s(%%rip)", job->ret_label);
+    call1(cg, "vo_set_emp", retrip);
+    fprintf(cg->body, "    call vo_job_%d\n", job->id);
+
+    Opnd out = alloc_temp(cg);
+    call1(cg, "vo_set_emp", out.text);
+    call2(cg, "vo_assign", out.text, retrip);
+    return out;
 }
 
 /* =========================================================================
@@ -263,9 +611,9 @@ static Opnd emit_expr(CG *cg, ASTNode *node) {
             callN(cg, "vo_set_yn", 2, o, im);
             return out;
         }
-        case NODE_NULL_LITERAL:
+        case NODE_EMP_LITERAL:
             out = alloc_temp(cg);
-            call1(cg, "vo_set_null", out.text);
+            call1(cg, "vo_set_emp", out.text);
             return out;
         case NODE_DEC_LITERAL: {
             /* stash the double as raw bits so we can move it with a plain
@@ -286,6 +634,8 @@ static Opnd emit_expr(CG *cg, ASTNode *node) {
             call2(cg, "vo_set_tex", out.text, rip);
             return out;
         }
+        case NODE_CALL:
+            return emit_call_expr(cg, node);
         case NODE_IDENTIFIER: {
             CSym *sym = scope_resolve(cg->scope, node->as.identifier.name);
             if (!sym) { cg_error(cg, node->line, "internal: unresolved identifier (analyzer should have caught this)"); out = alloc_temp(cg); return out; }
@@ -295,6 +645,24 @@ static Opnd emit_expr(CG *cg, ASTNode *node) {
             return global_opnd(global_label_for_addr(cg, node->as.vma_ref.name));
         case NODE_LOAD:
             return emit_expr(cg, node->as.load.vma);
+        case NODE_MODULE_REF: {
+            /* Module member value reference: math.NAME */
+            const char *mod_name = node->as.module_ref.module;
+            const char *member_name = node->as.module_ref.member;
+            CgModule *mod = cg_module_find(cg, mod_name);
+            if (!mod) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "unknown module '%s'", mod_name); cg_error(cg, node->line, errbuf); out = alloc_temp(cg); return out; }
+            CgModMember *mm = cg_module_member_find(mod, member_name);
+            if (!mm) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' has no member '%s'", mod_name, member_name); cg_error(cg, node->line, errbuf); out = alloc_temp(cg); return out; }
+            if (!mm->is_exported) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' member '%s' is not exported", mod_name, member_name); cg_error(cg, node->line, errbuf); out = alloc_temp(cg); return out; }
+            if (mm->kind == CG_MOD_MEMBER_VAR) {
+                if (mm->var_label[0] == '\0') { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module member '%s.%s' variable not initialized", mod_name, member_name); cg_error(cg, node->line, errbuf); out = alloc_temp(cg); return out; }
+                return global_opnd(mm->var_label);
+            } else {
+                char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' member '%s' is a job, not a value", mod_name, member_name); cg_error(cg, node->line, errbuf);
+                out = alloc_temp(cg);
+                return out;
+            }
+        }
         case NODE_UNARY: {
             Opnd a = emit_expr(cg, node->as.unary.operand);
             /* `a` may be a variable's own persistent storage (not a scratch
@@ -342,10 +710,10 @@ static Opnd emit_expr(CG *cg, ASTNode *node) {
                 case TOKEN_XOR:  fn = "vo_lxor"; needs_line = 0; break;
                 default: cg_error(cg, node->line, "unsupported binary operator"); fn = "vo_add"; break;
             }
-            if (needs_line) call4_imm(cg, fn, l.text, l.text, r.text, node->line);
-            else call3(cg, fn, l.text, l.text, r.text);
+            if (needs_line) call4_imm(cg, fn, dst.text, l.text, r.text, node->line);
+            else call3(cg, fn, dst.text, l.text, r.text);
             free_if_temp(cg, &r);
-            return l;
+            return dst;
         }
         case NODE_LENGTH_CALL: {
             Opnd a = emit_expr(cg, node->as.length_call.arg);
@@ -477,7 +845,7 @@ static void declare_var(CG *cg, ASTNode *node) {
 static void emit_stmt(CG *cg, ASTNode *node) {
     switch (node->type) {
         case NODE_VAR_DECL:
-        case NODE_CONST_DECL:
+        case NODE_HARD_DECL:
             declare_var(cg, node);
             break;
         case NODE_EXPR_STMT: {
@@ -556,9 +924,9 @@ static void emit_stmt(CG *cg, ASTNode *node) {
                 if (br->as.if_branch.condition) {
                     Opnd c = emit_expr(cg, br->as.if_branch.condition);
                     call1(cg, "vo_truthy", c.text);
-                    free_if_temp(cg, &c);
                     fprintf(cg->body, "    testl %%eax, %%eax\n");
                     fprintf(cg->body, "    jz .Lnext%d\n", next_lbl);
+                    free_if_temp(cg, &c);
                 }
                 emit_block(cg, br->as.if_branch.block);
                 fprintf(cg->body, "    jmp .Lend%d\n", end_lbl);
@@ -572,9 +940,9 @@ static void emit_stmt(CG *cg, ASTNode *node) {
             fprintf(cg->body, ".Ltop%d:\n", top);
             Opnd c = emit_expr(cg, node->as.while_stmt.condition);
             call1(cg, "vo_truthy", c.text);
-            free_if_temp(cg, &c);
             fprintf(cg->body, "    testl %%eax, %%eax\n");
             fprintf(cg->body, "    jz .Lend%d\n", end);
+            free_if_temp(cg, &c);
             emit_block(cg, node->as.while_stmt.block);
             fprintf(cg->body, "    jmp .Ltop%d\n", top);
             fprintf(cg->body, ".Lend%d:\n", end);
@@ -640,6 +1008,27 @@ static void emit_stmt(CG *cg, ASTNode *node) {
         case NODE_BLOCK:
             emit_block(cg, node);
             break;
+        case NODE_JOB_DECL:
+            /* Jobs are emitted as separate functions by codegen_compile -
+               nothing to execute in the calling body. */
+            break;
+        case NODE_GIVE_STMT:
+            emit_give_stmt(cg, node);
+            break;
+        case NODE_DEMAND_STMT:
+            emit_demand_stmt(cg, node);
+            break;
+        case NODE_SERVE_STMT:
+            emit_serve_stmt(cg, node);
+            break;
+        case NODE_DO_STMT:
+            emit_do_stmt(cg, node);
+            break;
+        case NODE_BRING_STMT:
+        case NODE_SHIP_STMT:
+        case NODE_PEICE_DECL:
+            /* Module statements are handled in the pre-pass; no codegen needed here */
+            break;
         default:
             cg_error(cg, node->line, "this statement form is not yet supported by the native compiler");
             break;
@@ -651,39 +1040,277 @@ static void emit_block(CG *cg, ASTNode *block) {
         emit_stmt(cg, block->as.block.statements.items[i]);
 }
 
+/* ---- GIVE: write the current job's return slot and jump to its epilogue ---- */
+static void emit_give_stmt(CG *cg, ASTNode *node) {
+    if (cg->cur_job_id < 0) {
+        cg_error(cg, node->line, "GIVE may only appear inside a JOB");
+        return;
+    }
+    Opnd v = emit_expr(cg, node->as.give_stmt.value);
+    char rip[48]; snprintf(rip, sizeof(rip), "%s(%%rip)", cg->cur_job_ret);
+    call2(cg, "vo_assign", rip, v.text);
+    free_if_temp(cg, &v);
+    fprintf(cg->body, "    jmp Ljobret_%d\n", cg->cur_job_id);
+}
+
+/* ---- SERVE: raise an issue. Inside a DO it transfers to GRABE; otherwise fatal. ---- */
+static void emit_serve_stmt(CG *cg, ASTNode *node) {
+    const CDo *doctx = cg_do_top(cg);
+    if (doctx) {
+        char flagrip[48]; snprintf(flagrip, sizeof(flagrip), "%s(%%rip)", doctx->flag_label);
+        const char *o[2] = { flagrip, "1" }; int im[2] = { 0, 1 };
+        callN(cg, "vo_set_yn", 2, o, im);
+        fprintf(cg->body, "    jmp .Ldoend_%d\n", doctx->end_label);
+    } else {
+        if (node->as.serve_stmt.value) {
+            Opnd v = emit_expr(cg, node->as.serve_stmt.value);
+            free_if_temp(cg, &v);
+        }
+        char linebuf[32]; snprintf(linebuf, sizeof(linebuf), "%d", node->line);
+        const char *lbl = intern_string(cg, "SERVE: issue raised");
+        char rip[48]; snprintf(rip, sizeof(rip), "%s(%%rip)", lbl);
+        const char *o[2] = { linebuf, rip }; int im[2] = { 1, 0 };
+        callN(cg, "vo_error", 2, o, im);
+    }
+}
+
+/* ---- DEMAND: assert a condition. Inside a DO, failure -> GRABE; else fatal. ---- */
+static void emit_demand_stmt(CG *cg, ASTNode *node) {
+    Opnd c = emit_expr(cg, node->as.demand_stmt.condition);
+    char linebuf[32]; snprintf(linebuf, sizeof(linebuf), "%d", node->line);
+    const char *o[2] = { c.text, linebuf }; int im[2] = { 0, 1 };
+    callN(cg, "vo_demand_check", 2, o, im);
+    int lbl = cg->label_id++;
+    fprintf(cg->body, "    testl %%eax, %%eax\n");
+    const CDo *doctx = cg_do_top(cg);
+    if (doctx) {
+        fprintf(cg->body, "    jnz .Ldemand_ok_%d\n", lbl);
+        free_if_temp(cg, &c);
+        char flagrip[48]; snprintf(flagrip, sizeof(flagrip), "%s(%%rip)", doctx->flag_label);
+        const char *fo[2] = { flagrip, "1" }; int fim[2] = { 0, 1 };
+        callN(cg, "vo_set_yn", 2, fo, fim);
+        fprintf(cg->body, "    jmp .Ldoend_%d\n", doctx->end_label);
+        fprintf(cg->body, ".Ldemand_ok_%d:\n", lbl);
+    } else {
+        fprintf(cg->body, "    jnz .Ldemand_ok_%d\n", lbl);
+        free_if_temp(cg, &c);
+        const char *msg = node->as.demand_stmt.message;
+        const char *text = msg ? msg : "DEMAND condition not met";
+        const char *lbl2 = intern_string(cg, text);
+        char rip[48]; snprintf(rip, sizeof(rip), "%s(%%rip)", lbl2);
+        const char *eo[2] = { linebuf, rip }; int eim[2] = { 1, 0 };
+        callN(cg, "vo_error", 2, eo, eim);
+        fprintf(cg->body, ".Ldemand_ok_%d:\n", lbl);
+    }
+}
+
+/* ---- DO / GRABE / ENDDO ---- */
+static void emit_do_stmt(CG *cg, ASTNode *node) {
+    int id = cg->label_id++;
+    char flag_label[40]; snprintf(flag_label, sizeof(flag_label), "vdoflag_%d", id);
+    const char *flag_symbol = global_label_for_addr(cg, flag_label);
+    char flagrip[48]; snprintf(flagrip, sizeof(flagrip), "%s(%%rip)", flag_symbol);
+    const char *o[2] = { flagrip, "0" }; int im[2] = { 0, 1 };
+    callN(cg, "vo_set_yn", 2, o, im);
+
+    cg_do_push(cg, flag_symbol, id);
+    if (node->as.do_stmt.try_block)
+        emit_block(cg, node->as.do_stmt.try_block);
+    cg_do_pop(cg);
+
+    fprintf(cg->body, ".Ldoend_%d:\n", id);
+    fprintf(cg->body, "    leaq %s(%%rip), %%rcx\n", flag_symbol);
+    call0(cg, "vo_truthy");
+    fprintf(cg->body, "    testl %%eax, %%eax\n");
+    fprintf(cg->body, "    jz .Ldoskip_%d\n", id);
+    if (node->as.do_stmt.catch_block)
+        emit_block(cg, node->as.do_stmt.catch_block);
+    fprintf(cg->body, ".Ldoskip_%d:\n", id);
+}
+
 /* =========================================================================
  * Top level driver
  * ========================================================================= */
-int codegen_compile(ASTNode *program, CgTarget target, FILE *out) {
+int codegen_compile(ASTNode *program, CgTarget target, const char *source_dir, FILE *out) {
     CG cg; memset(&cg, 0, sizeof(cg));
     cg.target = target;
     cg.abi = abi_for(target);
     cg.scope = scope_push(NULL);
+    cg.cur_job_id = -1;
     cg.body = open_memstream(&cg.body_buf, &cg.body_len);
     cg.rodata = open_memstream(&cg.rodata_buf, &cg.rodata_len);
+    cg.source_dir = source_dir;
 
+    /* ---- Module loading pass ----
+       Walk top-level statements to find BRINGs and load modules.
+       The root node from parser_parse_program() is NODE_PROGRAM (nested
+       blocks, e.g. a PEICE body, are NODE_BLOCK) - both share the same
+       `as.block.statements` layout, so accept either here. */
+    if (program->type == NODE_BLOCK || program->type == NODE_PROGRAM) {
+        for (int i = 0; i < program->as.block.statements.count; i++) {
+            ASTNode *stmt = program->as.block.statements.items[i];
+            if (stmt && stmt->type == NODE_BRING_STMT) {
+                if (cg_module_load(&cg, stmt->as.bring_stmt.path, source_dir)) {
+                    cg.had_error = 1;
+                    break;
+                }
+            }
+        }
+    }
+    if (cg.had_error) { free(cg.body_buf); free(cg.rodata_buf); return 1; }
+
+    /* ---- Pre-pass: register every top-level JOB and module jobs ---- */
+    for (int i = 0; i < program->as.block.statements.count; i++) {
+        ASTNode *stmt = program->as.block.statements.items[i];
+        if (!stmt || stmt->type != NODE_JOB_DECL) continue;
+        int id = cg.label_id++;
+        CJob *job = cg_job_add(&cg, stmt, id, stmt->as.job_decl.name, NULL);
+        if (!job) continue;
+        int pc = stmt->as.job_decl.param_count;
+        if (pc > 16) { cg_error(&cg, stmt->line, "too many job parameters (max 16)"); continue; }
+        job->param_count = pc;
+        for (int p = 0; p < pc; p++) {
+            char addr[40]; snprintf(addr, sizeof(addr), "jobp_%d_%d", id, p);
+            snprintf(job->param_labels[p], sizeof(job->param_labels[p]), "%s",
+                     global_label_for_addr(&cg, addr));
+        }
+        char retaddr[40]; snprintf(retaddr, sizeof(retaddr), "vjobret_%d", id);
+        snprintf(job->ret_label, sizeof(job->ret_label), "%s",
+                 global_label_for_addr(&cg, retaddr));
+    }
+
+    /* ---- Register module jobs (prefixed) ---- */
+    for (int m = 0; m < cg.module_count; m++) {
+        CgModule *mod = &cg.modules[m];
+        if (!mod->loaded || !mod->peice_ast) continue;
+        ASTNode *body = mod->peice_ast->as.peice_decl.body;
+        if (body && body->type == NODE_BLOCK) {
+            for (int i = 0; i < body->as.block.statements.count; i++) {
+                ASTNode *stmt = body->as.block.statements.items[i];
+                if (!stmt || stmt->type != NODE_JOB_DECL) continue;
+                int id = cg.label_id++;
+                char qualified[128];
+                snprintf(qualified, sizeof(qualified), "%s#%s", mod->name, stmt->as.job_decl.name);
+                CJob *job = cg_job_add(&cg, stmt, id, qualified, mod->name);
+                if (!job) { cg_error(&cg, stmt->line, "duplicate job name within module"); continue; }
+                int pc = stmt->as.job_decl.param_count;
+                if (pc > 16) { cg_error(&cg, stmt->line, "too many job parameters (max 16)"); continue; }
+                job->param_count = pc;
+                for (int p = 0; p < pc; p++) {
+                    char addr[40]; snprintf(addr, sizeof(addr), "jobp_%d_%d", id, p);
+                    snprintf(job->param_labels[p], sizeof(job->param_labels[p]), "%s",
+                             global_label_for_addr(&cg, addr));
+                }
+                char retaddr[40]; snprintf(retaddr, sizeof(retaddr), "vjobret_%d", id);
+                snprintf(job->ret_label, sizeof(job->ret_label), "%s",
+                         global_label_for_addr(&cg, retaddr));
+                /* Register this job in the module's member list if SHIPped */
+                for (int mm = 0; mm < cg.modules[m].member_count; mm++) {
+                    CgModMember *mmb = &cg.modules[m].members[mm];
+                    if (mmb->kind == CG_MOD_MEMBER_JOB && mmb->is_exported &&
+                        strcmp(mmb->name, stmt->as.job_decl.name) == 0) {
+                        mmb->job_internal = strdup(qualified);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /* ---- Initialize SHIPped module variables ----
+       Module member vars (mm->var_label) get no storage until now: walk
+       each loaded module's own top-level VAR/HARD decls, allocate a .bss
+       slot for every SHIPped one, and emit its initializer into vo_main's
+       body (which cg.body still points at here) so it runs before any
+       reference to module.MEMBER. Non-exported module-level vars are left
+       alone - they're only usable from inside the module's own job bodies,
+       which isn't wired up yet and isn't needed for math.vo-style modules. */
+    for (int m = 0; m < cg.module_count; m++) {
+        CgModule *mod = &cg.modules[m];
+        if (!mod->loaded || !mod->peice_ast) continue;
+        ASTNode *body = mod->peice_ast->as.peice_decl.body;
+        if (!body || body->type != NODE_BLOCK) continue;
+        for (int i = 0; i < body->as.block.statements.count; i++) {
+            ASTNode *stmt = body->as.block.statements.items[i];
+            if (!stmt || (stmt->type != NODE_VAR_DECL && stmt->type != NODE_HARD_DECL)) continue;
+            const char *var_name = stmt->as.var_decl.name; /* var_decl/hard_decl share layout */
+            CgModMember *mm = cg_module_member_find(mod, var_name);
+            if (!mm || mm->kind != CG_MOD_MEMBER_VAR || !mm->is_exported) continue;
+
+            CVmaSlot *slot = vma_alloc_next(&cg.vmas);
+            const char *label = global_label_for_addr(&cg, slot->address);
+            snprintf(mm->var_label, sizeof(mm->var_label), "%s", label);
+
+            Opnd init = emit_expr(&cg, stmt->as.var_decl.init);
+            char rip[48]; snprintf(rip, sizeof(rip), "%s(%%rip)", label);
+            call2(&cg, "vo_assign", rip, init.text);
+            free_if_temp(&cg, &init);
+        }
+    }
+
+    /* ---- emit vo_main body (JOB decls are no-ops here) ---- */
     int saved_for_id_start = cg.for_id;
     emit_block(&cg, program);
-    int total_for_loops = cg.for_id - saved_for_id_start;
-
     MEMSTREAM_CLOSE(cg.body, &cg.body_buf, &cg.body_len);
-    MEMSTREAM_CLOSE(cg.rodata, &cg.rodata_buf, &cg.rodata_len);
 
     if (cg.had_error) { free(cg.body_buf); free(cg.rodata_buf); return 1; }
 
-    long frame_bytes = (long)(cg.max_depth + 1) * SLOT_SIZE + cg.abi.shadow_space;
-    frame_bytes = (frame_bytes + 15) & ~15L; /* round up to 16 for call-site alignment */
-
     fprintf(out, "# Generated by voc (Virtual Order native compiler). Do not edit by hand.\n");
     fprintf(out, "    .text\n");
-    fprintf(out, "    .globl vo_main\n");
-    fprintf(out, "vo_main:\n");
-    fprintf(out, "    pushq %%rbp\n");
-    fprintf(out, "    movq %%rsp, %%rbp\n");
-    fprintf(out, "    subq $%ld, %%rsp\n", frame_bytes);
-    fprintf(out, "%s", cg.body_buf);
-    fprintf(out, "    leave\n");
-    fprintf(out, "    ret\n\n");
+
+    /* ---- write vo_main ---- */
+    {
+        long frame_bytes = (long)(cg.max_depth + 1) * SLOT_SIZE + cg.abi.shadow_space;
+        frame_bytes = (frame_bytes + 15) & ~15L;
+        fprintf(out, "    .globl vo_main\nvo_main:\n    pushq %%rbp\n    movq %%rsp, %%rbp\n    subq $%ld, %%rsp\n", frame_bytes);
+        fprintf(out, "%s", cg.body_buf);
+        fprintf(out, "    leave\n    ret\n\n");
+        free(cg.body_buf);
+    }
+
+    /* ---- write each JOB as its own function ---- */
+    for (int j = 0; j < cg.job_count; j++) {
+        CJob *job = &cg.jobs[j];
+        int pc = job->param_count;
+
+        cg.cur_job_id = job->id;
+        cg.cur_job_ret = job->ret_label;
+        cg.cur_job_module = job->module_name;
+        cg.depth = 0;
+        cg.max_depth = 0;
+        cg.body = open_memstream(&cg.body_buf, &cg.body_len);
+
+        CScope *saved_scope = cg.scope;
+        cg.scope = scope_push(saved_scope);
+        for (int p = 0; p < pc; p++) {
+            CSym *sym = scope_declare(cg.scope, job->decl->as.job_decl.params[p].name);
+            char addr[40]; snprintf(addr, sizeof(addr), "jobp_%d_%d", job->id, p);
+            snprintf(sym->vma, sizeof(sym->vma), "%s", addr);
+        }
+
+        emit_block(&cg, job->decl->as.job_decl.body);
+        fprintf(cg.body, "Ljobret_%d:\n", job->id);
+        MEMSTREAM_CLOSE(cg.body, &cg.body_buf, &cg.body_len);
+        cg.scope = saved_scope;
+        cg.cur_job_id = -1;
+        cg.cur_job_ret = NULL;
+        cg.cur_job_module = NULL;
+
+        if (cg.had_error) break;
+
+        long jframe = (long)(cg.max_depth + 1) * SLOT_SIZE + cg.abi.shadow_space;
+        jframe = (jframe + 15) & ~15L;
+        fprintf(out, "    .globl vo_job_%d\nvo_job_%d:\n    pushq %%rbp\n    movq %%rsp, %%rbp\n    subq $%ld, %%rsp\n", job->id, job->id, jframe);
+        fprintf(out, "%s", cg.body_buf);
+        fprintf(out, "    leave\n    ret\n\n");
+        free(cg.body_buf);
+    }
+
+    if (cg.had_error) { free(cg.rodata_buf); return 1; }
+
+    int total_for_loops = cg.for_id - saved_for_id_start;
+
+    MEMSTREAM_CLOSE(cg.rodata, &cg.rodata_buf, &cg.rodata_len);
 
     fprintf(out, "    .section .rodata\n");
     fprintf(out, "%s", cg.rodata_buf);
@@ -697,7 +1324,9 @@ int codegen_compile(ASTNode *program, CgTarget target, FILE *out) {
         fprintf(out, "    .align 8\nfor_end_%d:\n    .zero %ld\n", i, SLOT_SIZE);
     }
 
-    free(cg.body_buf);
     free(cg.rodata_buf);
+    free(cg.jobs);
+    free(cg.do_stack);
+    free(cg.modules);
     return 0;
 }

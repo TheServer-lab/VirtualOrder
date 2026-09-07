@@ -67,7 +67,7 @@ source.vo  ->  lexer  ->  parser  ->  analyzer  ->  runtime
 - **Assembly-style GOTO** — `Label:` / `GOTO Label`, whole-program flat namespace,
   forward references allowed.
 
-See [`VirtualOrder-v1.3—Language-Specification.md`](VirtualOrder-v1.3—Language-Specification.md) for the full language
+See [`VirtualOrder-v1.3-Language-Specification.md`](VirtualOrder-v1.3-Language-Specification.md) for the full language
 specification.
 
 ## Building

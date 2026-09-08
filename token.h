@@ -20,6 +20,10 @@ typedef enum {
     TOKEN_TYPE_YN,
     TOKEN_TYPE_COLL,
     TOKEN_TYPE_EMP,
+    TOKEN_TYPE_FILE,
+    TOKEN_TYPE_TASK,
+    TOKEN_TYPE_LOCK,
+    TOKEN_TYPE_EVENT,
 
     /* Declaration keywords */
     TOKEN_VAR,
@@ -28,6 +32,7 @@ typedef enum {
     TOKEN_STORE,
     TOKEN_LOAD,
     TOKEN_SHOW,
+    TOKEN_TAKE,
     TOKEN_CLEAN,
     TOKEN_CLEANALL,
     TOKEN_AUTOCLEAN,
@@ -88,6 +93,48 @@ typedef enum {
     TOKEN_SERVE,
     TOKEN_ISSUE,
 
+    /* Collection / text commands */
+    TOKEN_ATTACH,
+    TOKEN_PLACE,
+    TOKEN_ERASE,
+    TOKEN_COUNT,
+    TOKEN_SEEK,
+    TOKEN_HAS,
+    TOKEN_BIND,
+    TOKEN_SEVER,
+    TOKEN_CUT,
+    TOKEN_RAISE,
+    TOKEN_LOWER,
+
+    /* File commands */
+    TOKEN_UNSEAL,
+    TOKEN_SEAL,
+    TOKEN_DRAW,
+    TOKEN_PUT,
+    TOKEN_MOVE,
+    TOKEN_MAKE,
+    TOKEN_RECALL,
+    TOKEN_CLONE,
+    TOKEN_DELIVER,
+
+    /* Concurrency */
+    TOKEN_SPAWN,
+    TOKEN_HOLD,
+    TOKEN_CLAIM,
+    TOKEN_HALT,
+    TOKEN_SEIZE,
+    TOKEN_RELEASE,
+    TOKEN_ALIGN,
+
+    /* Event control */
+    TOKEN_ARM,
+    TOKEN_DISARM,
+    TOKEN_FIRE,
+    TOKEN_RANK,
+    TOKEN_KILL,
+    TOKEN_SCREEN,
+    TOKEN_LINK,
+
     /* Operators */
     TOKEN_PLUS, TOKEN_MINUS, TOKEN_STAR, TOKEN_SLASH, TOKEN_PERCENT, TOKEN_POWER,
     TOKEN_SHL, TOKEN_SHR,
@@ -101,6 +148,7 @@ typedef enum {
     /* Punctuation */
     TOKEN_LPAREN, TOKEN_RPAREN,
     TOKEN_LBRACKET, TOKEN_RBRACKET,
+    TOKEN_LBRACE, TOKEN_RBRACE,
     TOKEN_COMMA, TOKEN_COLON,
     TOKEN_DOT,
     TOKEN_NEWLINE

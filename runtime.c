@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include <setjmp.h>
+#include <time.h>
 #include "runtime.h"
 #include "parser.h"
 #include "ast.h"
@@ -13,7 +14,12 @@
 /* =======================================================================
  * Values
  * ===================================================================== */
-typedef enum { VAL_NUM, VAL_DEC, VAL_TEX, VAL_YN, VAL_COLL, VAL_EMP } ValType;
+typedef enum { VAL_NUM, VAL_DEC, VAL_TEX, VAL_YN, VAL_COLL, VAL_EMP,
+               VAL_FILE, VAL_TASK, VAL_LOCK, VAL_EVENT } ValType;
+
+#define TASK_PENDING 0
+#define TASK_DONE    1
+#define TASK_CANCELLED 2
 
 typedef struct Value {
     ValType type;
@@ -23,6 +29,15 @@ typedef struct Value {
     int yn;
     struct Value *items;
     int count, capacity;
+    FILE *file;                /* VAL_FILE */
+    char *file_mode;           /* VAL_FILE: "r" "w" "a" "rw" */
+    char *job_name;            /* VAL_TASK */
+    struct Value *args;        /* VAL_TASK */
+    int argc;                  /* VAL_TASK */
+    int task_state;            /* VAL_TASK */
+    struct Value *task_result; /* VAL_TASK */
+    int lock_held;             /* VAL_LOCK */
+    int event_id;              /* VAL_EVENT: index into vm->handlers */
 } Value;
 
 static Value value_num(long n)  { Value v = {0}; v.type = VAL_NUM; v.num = n; return v; }
@@ -31,6 +46,19 @@ static Value value_yn(int b)    { Value v = {0}; v.type = VAL_YN; v.yn = b ? 1 :
 static Value value_emp(void)    { Value v = {0}; v.type = VAL_EMP; return v; }
 static Value value_tex(const char *s) { Value v = {0}; v.type = VAL_TEX; v.tex = strdup(s ? s : ""); return v; }
 static Value value_coll_empty(void) { Value v = {0}; v.type = VAL_COLL; return v; }
+static Value value_file(FILE *f)    { Value v = {0}; v.type = VAL_FILE; v.file = f; return v; }
+
+/* Classify a raw input line: whole-string integer -> NUM, whole-string
+   floating point -> DEC, otherwise TEX. Empty string is TEX. */
+static Value value_auto_classify(const char *s) {
+    if (!s || !*s) return value_tex(s ? s : "");
+    char *end;
+    long n = strtol(s, &end, 10);
+    if (end != s && *end == '\0') return value_num(n);
+    double d = strtod(s, &end);
+    if (end != s && *end == '\0') return value_dec(d);
+    return value_tex(s);
+}
 
 static void value_free(Value *v) {
     if (!v) return;
@@ -40,6 +68,13 @@ static void value_free(Value *v) {
         free(v->items);
         v->items = NULL; v->count = v->capacity = 0;
     }
+    if (v->type == VAL_TASK) {
+        free(v->job_name); v->job_name = NULL;
+        for (int i = 0; i < v->argc; i++) value_free(&v->args[i]);
+        free(v->args); v->args = NULL; v->argc = 0;
+        if (v->task_result) { value_free(v->task_result); free(v->task_result); v->task_result = NULL; }
+    }
+    if (v->type == VAL_FILE) { free(v->file_mode); v->file_mode = NULL; }
 }
 
 static Value value_copy(Value v) {
@@ -50,6 +85,15 @@ static Value value_copy(Value v) {
         out.capacity = v.count;
         for (int i = 0; i < v.count; i++) out.items[i] = value_copy(v.items[i]);
     }
+    if (v.type == VAL_TASK) {
+        out.job_name = strdup(v.job_name ? v.job_name : "");
+        out.args = v.argc ? malloc(sizeof(Value) * v.argc) : NULL;
+        out.argc = v.argc;
+        for (int i = 0; i < v.argc; i++) out.args[i] = value_copy(v.args[i]);
+        out.task_result = v.task_result ? malloc(sizeof(Value)) : NULL;
+        if (out.task_result) *out.task_result = value_copy(*v.task_result);
+    }
+    if (v.type == VAL_FILE) { out.file = v.file; out.file_mode = strdup(v.file_mode ? v.file_mode : ""); }
     return out;
 }
 
@@ -73,23 +117,29 @@ static char *value_to_cstr(Value v) {
             size_t cap = 64, len = 0;
             char *out = malloc(cap);
             out[0] = '\0';
-            len = 1;
-            strcpy(out, "[");
-            len = 1;
+            out[len++] = '[';
             for (int i = 0; i < v.count; i++) {
                 char *piece = value_to_cstr(v.items[i]);
                 size_t plen = strlen(piece);
-                while (len + plen + 4 > cap) { cap *= 2; out = realloc(out, cap); }
-                if (i > 0) { strcpy(out + len - 1, ", "); len += 1; out[len] = '\0'; }
-                strcpy(out + len - 1, piece);
+                if (i > 0) {
+                    while (len + 3 > cap) { cap *= 2; out = realloc(out, cap); }
+                    out[len++] = ',';
+                    out[len++] = ' ';
+                }
+                while (len + plen + 2 > cap) { cap *= 2; out = realloc(out, cap); }
+                memcpy(out + len, piece, plen);
                 len += plen;
                 free(piece);
             }
-            if (len + 2 > cap) { cap += 2; out = realloc(out, cap); }
-            out[len - 1] = ']';
+            while (len + 2 > cap) { cap *= 2; out = realloc(out, cap); }
+            out[len++] = ']';
             out[len] = '\0';
             return out;
         }
+        case VAL_FILE:  { snprintf(buf, sizeof(buf), "FILE@%p", (void*)v.file); return strdup(buf); }
+        case VAL_EVENT: { snprintf(buf, sizeof(buf), "EVENT#%d", v.event_id); return strdup(buf); }
+        case VAL_LOCK:  { snprintf(buf, sizeof(buf), "LOCK#%d", v.lock_held); return strdup(buf); }
+        case VAL_TASK:  { snprintf(buf, sizeof(buf), "TASK(%s)", v.job_name ? v.job_name : "?"); return strdup(buf); }
     }
     return strdup("");
 }
@@ -101,6 +151,10 @@ static int value_to_bool(Value v) {
         case VAL_TEX: return v.tex && v.tex[0] != '\0';
         case VAL_YN:  return v.yn != 0;
         case VAL_COLL: return v.count != 0;
+        case VAL_FILE: return v.file != NULL;
+        case VAL_TASK: return v.job_name != NULL;
+        case VAL_LOCK: return v.lock_held >= 0;
+        case VAL_EVENT: return v.event_id >= 0;
         case VAL_EMP: return 0;
     }
     return 0;
@@ -117,6 +171,12 @@ static int value_equal(Value a, Value b) {
         case VAL_TEX: return strcmp(a.tex ? a.tex : "", b.tex ? b.tex : "") == 0;
         case VAL_YN:  return a.yn == b.yn;
         case VAL_EMP: return 1;
+        case VAL_FILE: return a.file == b.file;
+        case VAL_EVENT: return a.event_id == b.event_id;
+        case VAL_LOCK: return a.lock_held == b.lock_held;
+        case VAL_TASK:
+            return (a.job_name && b.job_name && strcmp(a.job_name, b.job_name) == 0)
+                && a.argc == b.argc;
         case VAL_COLL:
             if (a.count != b.count) return 0;
             for (int i = 0; i < a.count; i++) if (!value_equal(a.items[i], b.items[i])) return 0;
@@ -344,13 +404,21 @@ typedef struct {
     ASTNode *condition;
     int last_state;
     int body_start;
+    int enabled;       /* 1 unless DISARMED */
+    int rank;          /* event priority (higher dispatched first) */
+    int killed;        /* 1 once KILLed */
+    int linked_to;     /* index of linked event, or -1 */
+    ASTNode *screen;   /* additional screen condition, or NULL */
 } Handler;
 
 typedef struct {
     int handler_index;
     int has_values;
     Value old_value, new_value;
+    int rank;
 } QueueEntry;
+
+static Value eval_expr(VM *vm, ASTNode *node);
 
 #define DEFAULT_MAX_QUEUE_DEPTH 1000
 
@@ -470,6 +538,7 @@ static void compile_stmt(Compiler *c, ASTNode *node) {
         case NODE_CLEAN_STMT: case NODE_CLEANALL_STMT:
         case NODE_AUTOCLEAN_STMT:
         case NODE_DEMAND_STMT: case NODE_SERVE_STMT:
+        case NODE_COMMAND:
             emit(c, I_STMT, node);
             break;
 
@@ -967,19 +1036,42 @@ static int module_initialize(VM *vm, Module *mod) {
     fprintf(stderr, "\n");
     va_end(ap);
     vm->had_runtime_error = 1;
-    longjmp(vm->abort_buf, 1);
+    /* Fatal, uncatchable error: terminate the process. The CRT
+       setjmp/longjmp pair used for vm->abort_buf proved unreliable in this
+       build (crashes instead of unwinding), and these errors are not
+       recoverable anyway - DO/catch uses the separate do_catch_buf
+       mechanism which is unaffected. exit() flushes stdio so the message
+       reaches the terminal before the process ends. */
+    exit(1);
 }
 
 static void enqueue(VM *vm, int handler_index, int has_values, Value old_v, Value new_v) {
+    Handler *h = &vm->handlers[handler_index];
+    if (!h->enabled || h->killed) { value_free(&old_v); value_free(&new_v); return; }
+    if (h->screen) {
+        Value sv = eval_expr(vm, h->screen);
+        int ok = value_to_bool(sv);
+        value_free(&sv);
+        if (!ok) { value_free(&old_v); value_free(&new_v); return; }
+    }
     if (vm->q_count == vm->q_capacity) {
         vm->q_capacity = vm->q_capacity ? vm->q_capacity * 2 : 16;
         vm->queue = realloc(vm->queue, sizeof(QueueEntry) * vm->q_capacity);
     }
-    QueueEntry *e = &vm->queue[vm->q_count++];
+    /* Insert by rank: higher rank is dispatched first; equal ranks keep
+       declaration order (stable insert after existing entries of same rank). */
+    int pos = vm->q_count;
+    for (int i = 0; i < vm->q_count; i++) {
+        if (vm->queue[i].rank < h->rank) { pos = i; break; }
+    }
+    memmove(vm->queue + pos + 1, vm->queue + pos, sizeof(QueueEntry) * (vm->q_count - pos));
+    QueueEntry *e = &vm->queue[pos];
     e->handler_index = handler_index;
     e->has_values = has_values;
     e->old_value = old_v;
     e->new_value = new_v;
+    e->rank = h->rank;
+    vm->q_count++;
 }
 
 static void scope_pop_with_autoclean(VM *vm) {
@@ -1039,6 +1131,17 @@ static const char *target_vma_addr(VM *vm, ASTNode *node) {
         if (sym && !sym->is_loop_var) return sym->vma;
     }
     return NULL;
+}
+
+/* Map a *string* (from the parser) to a VMA address: a declared variable
+   name resolves through the scope to its auto-allocated VMA; anything else
+   (raw VMA addresses like "A1") is used as-is. Returns NULL only if the
+   name is neither. */
+static const char *resolve_name_to_vma(VM *vm, const char *name) {
+    if (!name) return NULL;
+    Symbol *sym = scope_resolve(vm->scope, name);
+    if (sym && !sym->is_loop_var) return sym->vma;
+    return name; /* raw VMA address; rvma_set validates the allocation */
 }
 
 static void dispatch_triggers(VM *vm, const char *addr, Value old_v, int changed) {
@@ -1186,6 +1289,625 @@ static JobEntry *job_find_by_name(VM *vm, const char *name) {
     return NULL;
 }
 
+/* Run a job by its registered name ("mod#job" or "job"), binding args to
+   fresh param VMAs. Returns the job's GIVE value (or EMP). */
+static Value call_job(VM *vm, const char *reg_name, Value *args, int nargs, int line) {
+    JobEntry *job = job_find_by_name(vm, reg_name);
+    if (!job) runtime_error(vm, line, "undefined job '%s'", reg_name);
+    if (nargs != job->param_count)
+        runtime_error(vm, line, "job '%s' expects %d arguments but got %d",
+                      job->name, job->param_count, nargs);
+
+    Scope *saved_scope = vm->scope;
+    int saved_giving = vm->giving;
+    Value saved_give = vm->give_value;
+    vm->giving = 0;
+
+    vm->scope = scope_push(saved_scope);
+    for (int i = 0; i < nargs; i++) {
+        RVmaSlot *slot = rvma_alloc_next(&vm->vmas, job->params[i].name);
+        Symbol *sym = scope_declare(vm->scope, job->params[i].name);
+        snprintf(sym->vma, sizeof(sym->vma), "%s", slot->address);
+        value_free(&slot->value);
+        slot->value = value_copy(args[i]);
+    }
+
+    int saved_active_module = vm->active_module;
+    const char *hash = strchr(reg_name, '#');
+    if (hash) {
+        int mlen = (int)(hash - reg_name);
+        char *mname = malloc((size_t)mlen + 1);
+        memcpy(mname, reg_name, (size_t)mlen);
+        mname[mlen] = '\0';
+        Module *m = module_find(vm, mname);
+        if (m) vm->active_module = (int)(m - vm->modules);
+        free(mname);
+    } else {
+        vm->active_module = -1;
+    }
+
+    run_range(vm, job->body_start);
+
+    Value result = vm->giving ? vm->give_value : value_emp();
+
+    vm->give_value = saved_give;
+    vm->giving = saved_giving;
+    vm->active_module = saved_active_module;
+
+    scope_pop_with_autoclean(vm);
+    return result;
+}
+
+/* ASCII string helpers for text commands */
+static char *astr_trim(char *s) {
+    char *end;
+    while (*s && (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')) s++;
+    end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r')) end--;
+    *end = '\0';
+    return s;
+}
+static void astr_map_case(char *s, int upper) {
+    for (; *s; s++) {
+        if (upper && *s >= 'a' && *s <= 'z') *s = (char)(*s - 'a' + 'A');
+        else if (!upper && *s >= 'A' && *s <= 'Z') *s = (char)(*s - 'A' + 'a');
+    }
+}
+static long astr_find(const char *hay, const char *ndl) {
+    if (!hay || !ndl) return -1;
+    if (ndl[0] == '\0') return 0;
+    char *p = strstr(hay, ndl);
+    return p ? (long)(p - hay) : -1;
+}
+
+/* Build a TASK value from a SPAWN call node (captures job target + args). */
+static Value spawn_from_call(VM *vm, ASTNode *node, int line) {
+    ASTNode *call = node;
+    if (!call || call->type != NODE_CALL)
+        runtime_error(vm, line, "SPAWN expects a job call, e.g. SPAWN work(21)");
+
+    char *owned_name = NULL;
+    const char *resolved = NULL;
+    if (call->as.call.callee->type == NODE_MODULE_REF) {
+        const char *mod_name = call->as.call.callee->as.module_ref.module;
+        const char *member_name = call->as.call.callee->as.module_ref.member;
+        ModMember *mm = module_resolve_member(vm, mod_name, member_name);
+        if (!mm) runtime_error(vm, call->line, "module '%s' has no member '%s'", mod_name, member_name);
+        if (!mm->is_exported) runtime_error(vm, call->line, "module '%s' member '%s' is not exported", mod_name, member_name);
+        if (mm->kind != MOD_MEMBER_JOB) runtime_error(vm, call->line, "module '%s' member '%s' is not a job", mod_name, member_name);
+        resolved = mm->job_internal;
+    } else if (call->as.call.callee->type == NODE_IDENTIFIER) {
+        const char *n = call->as.call.callee->as.identifier.name;
+        if (vm->active_module >= 0) {
+            Module *mod = &vm->modules[vm->active_module];
+            char qualified[128];
+            snprintf(qualified, sizeof(qualified), "%s#%s", mod->name, n);
+            if (job_find_by_name(vm, qualified)) { owned_name = strdup(qualified); resolved = owned_name; }
+        }
+        if (!resolved) { owned_name = strdup(n); resolved = owned_name; }
+        if (!job_find_by_name(vm, resolved))
+            runtime_error(vm, call->line, "undefined job '%s'", n);
+    } else {
+        if (owned_name) free(owned_name);
+        runtime_error(vm, line, "only direct job calls can be spawned");
+    }
+
+    Value task = {0};
+    task.type = VAL_TASK;
+    task.task_state = TASK_PENDING;
+    task.job_name = strdup(resolved);
+    free(owned_name);
+    int nargs = call->as.call.args.count;
+    if (nargs) task.args = malloc(sizeof(Value) * nargs);
+    task.argc = nargs;
+    for (int i = 0; i < nargs; i++)
+        task.args[i] = eval_expr(vm, call->as.call.args.items[i]);
+    return task;
+}
+
+/* Run a deferred task once, storing the result. */
+static void task_run(VM *vm, Value *task, int line) {
+    if (task->task_state == TASK_CANCELLED)
+        runtime_error(vm, line, "task '%s' has been halted", task->job_name ? task->job_name : "?");
+    if (task->task_state == TASK_DONE) return;
+    Value result = call_job(vm, task->job_name, task->args, task->argc, line);
+    task->task_state = TASK_DONE;
+    if (task->task_result) { value_free(task->task_result); free(task->task_result); task->task_result = NULL; }
+    task->task_result = malloc(sizeof(Value));
+    *(task->task_result) = result;
+}
+
+/* Resolve a task operand to its stored value when possible so that task
+   state (run once) persists in the owning variable. Returns 1 on success. */
+static int resolve_task_lvalue(VM *vm, ASTNode *op, int line, Value **out) {
+    if (op->type == NODE_IDENTIFIER || op->type == NODE_VMA_REF || op->type == NODE_INDEX) {
+        Value *p = lvalue_ptr(vm, op, line);
+        if (p && p->type == VAL_TASK) { *out = p; return 1; }
+        if (p) return 0;
+    }
+    return 0;
+}
+
+/* Execute a NODE_COMMAND (builtin). Expression-form commands return a
+   result value; statement-form commands return EMP (mutations applied via
+   lvalue). */
+static Value exec_command(VM *vm, ASTNode *node) {
+    int kind = node->as.command.kind;
+    NodeList *a = &node->as.command.args;
+    int line = node->line;
+
+    switch (kind) {
+    case CMD_ATTACH: {
+        if (a->count != 2) runtime_error(vm, line, "ATTACH expects 2 operands: collection, item");
+        Value *lhs = lvalue_ptr(vm, a->items[0], line);
+        if (!lhs || lhs->type != VAL_COLL) runtime_error(vm, line, "ATTACH expects a collection reference");
+        Value item = eval_expr(vm, a->items[1]);
+        value_coll_push(lhs, item);
+        return value_emp();
+    }
+    case CMD_PLACE: {
+        if (a->count != 3) runtime_error(vm, line, "PLACE expects 3 operands: collection, index, item");
+        Value *lhs = lvalue_ptr(vm, a->items[0], line);
+        if (!lhs || lhs->type != VAL_COLL) runtime_error(vm, line, "PLACE expects a collection reference");
+        Value idxv = eval_expr(vm, a->items[1]);
+        long i = value_as_long(idxv);
+        value_free(&idxv);
+        if (i < 0 || i > lhs->count) runtime_error(vm, line, "PLACE index %ld out of bounds", i);
+        Value item = eval_expr(vm, a->items[2]);
+        if (lhs->capacity < lhs->count + 1) {
+            lhs->capacity = lhs->capacity ? lhs->capacity * 2 : 4;
+            lhs->items = realloc(lhs->items, sizeof(Value) * lhs->capacity);
+        }
+        memmove(lhs->items + i + 1, lhs->items + i, sizeof(Value) * (lhs->count - i));
+        lhs->items[i] = item;
+        lhs->count++;
+        return value_emp();
+    }
+    case CMD_ERASE: {
+        if (a->count == 2) {
+            Value *lhs = lvalue_ptr(vm, a->items[0], line);
+            if (!lhs || lhs->type != VAL_COLL) runtime_error(vm, line, "ERASE expects a collection reference");
+            Value idxv = eval_expr(vm, a->items[1]);
+            long i = value_as_long(idxv);
+            value_free(&idxv);
+            if (i < 0 || i >= lhs->count) runtime_error(vm, line, "ERASE index %ld out of bounds", i);
+            value_free(&lhs->items[i]);
+            memmove(lhs->items + i, lhs->items + i + 1, sizeof(Value) * (lhs->count - i - 1));
+            lhs->count--;
+            return value_emp();
+        }
+        if (a->count == 1) {
+            Value p = eval_expr(vm, a->items[0]);
+            char *path = value_to_cstr(p);
+            int ok = remove(path) == 0;
+            if (!ok) runtime_error(vm, line, "ERASE (file) failed on '%s'", path);
+            free(path);
+            value_free(&p);
+            return value_emp();
+        }
+        runtime_error(vm, line, "ERASE expects collection+index or a text path");
+        return value_emp();
+    }
+    case CMD_COUNT: {
+        if (a->count != 1) runtime_error(vm, line, "COUNT expects 1 operand");
+        Value v = eval_expr(vm, a->items[0]);
+        long n;
+        if (v.type == VAL_COLL) n = v.count;
+        else if (v.type == VAL_TEX) n = (long)strlen(v.tex ? v.tex : "");
+        else { value_free(&v); runtime_error(vm, line, "COUNT expects a collection or text value"); return value_emp(); }
+        value_free(&v);
+        return value_num(n);
+    }
+    case CMD_TAKE: {
+        if (a->count != 1) runtime_error(vm, line, "TAKE expects 1 operand: prompt");
+        Value prompt = eval_expr(vm, a->items[0]);
+        char *ps = value_to_cstr(prompt);
+        fputs(ps, stdout);
+        fflush(stdout);
+        free(ps);
+        value_free(&prompt);
+        char buf[4096];
+        if (!fgets(buf, sizeof(buf), stdin)) buf[0] = '\0';
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) buf[--len] = '\0';
+        return value_auto_classify(buf);
+    }
+    case CMD_SEEK: {
+        if (a->count != 2) runtime_error(vm, line, "SEEK expects 2 operands: collection/text, target");
+        Value hay = eval_expr(vm, a->items[0]);
+        Value ndl = eval_expr(vm, a->items[1]);
+        Value result;
+        if (hay.type == VAL_COLL) {
+            long found = -1;
+            for (int i = 0; i < hay.count; i++)
+                if (value_equal(hay.items[i], ndl)) { found = i; break; }
+            result = found >= 0 ? value_num(found) : value_emp();
+        } else if (hay.type == VAL_TEX) {
+            char *hs = value_to_cstr(hay);
+            char *ns = value_to_cstr(ndl);
+            long p = astr_find(hs, ns);
+            result = p >= 0 ? value_num(p) : value_emp();
+            free(hs); free(ns);
+        } else {
+            value_free(&hay);
+            runtime_error(vm, line, "SEEK expects a collection or text value");
+            return value_emp();
+        }
+        value_free(&hay);
+        value_free(&ndl);
+        return result;
+    }
+    case CMD_HAS: {
+        if (a->count == 1) {
+            Value p = eval_expr(vm, a->items[0]);
+            char *path = value_to_cstr(p);
+            FILE *f = fopen(path, "r");
+            int exists = f != NULL;
+            if (f) fclose(f);
+            free(path);
+            value_free(&p);
+            return value_yn(exists);
+        }
+        if (a->count == 2) {
+            Value hay = eval_expr(vm, a->items[0]);
+            Value ndl = eval_expr(vm, a->items[1]);
+            int found;
+            if (hay.type == VAL_COLL) {
+                found = 0;
+                for (int i = 0; i < hay.count; i++)
+                    if (value_equal(hay.items[i], ndl)) { found = 1; break; }
+            } else if (hay.type == VAL_TEX) {
+                char *hs = value_to_cstr(hay);
+                char *ns = value_to_cstr(ndl);
+                found = astr_find(hs, ns) >= 0;
+                free(hs); free(ns);
+            } else {
+                value_free(&hay); value_free(&ndl);
+                runtime_error(vm, line, "HAS expects a collection or text value");
+                return value_emp();
+            }
+            value_free(&hay);
+            value_free(&ndl);
+            return value_yn(found);
+        }
+        runtime_error(vm, line, "HAS expects 1 operand (path) or 2 operands (collection/text, target)");
+        return value_emp();
+    }
+    case CMD_BIND: {
+        if (a->count != 2) runtime_error(vm, line, "BIND expects 2 operands: collection, separator");
+        Value coll = eval_expr(vm, a->items[0]);
+        Value sep = eval_expr(vm, a->items[1]);
+        if (coll.type != VAL_COLL) { value_free(&coll); value_free(&sep); runtime_error(vm, line, "BIND expects a collection"); return value_emp(); }
+        char *seps = value_to_cstr(sep);
+        size_t cap = 64, len = 0;
+        char *out = malloc(cap);
+        out[0] = '\0';
+        for (int i = 0; i < coll.count; i++) {
+            char *piece = value_to_cstr(coll.items[i]);
+            size_t plen = strlen(piece);
+            while (len + plen + strlen(seps) + 2 > cap) { cap *= 2; out = realloc(out, cap); }
+            if (i > 0) { memcpy(out + len, seps, strlen(seps)); len += strlen(seps); }
+            memcpy(out + len, piece, plen);
+            len += plen;
+            out[len] = '\0';
+            free(piece);
+        }
+        free(seps);
+        value_free(&coll);
+        value_free(&sep);
+        Value res = value_tex(out);
+        free(out);
+        return res;
+    }
+    case CMD_SEVER: {
+        if (a->count != 2) runtime_error(vm, line, "SEVER expects 2 operands: text, separator");
+        Value tex = eval_expr(vm, a->items[0]);
+        Value sep = eval_expr(vm, a->items[1]);
+        if (tex.type != VAL_TEX) { value_free(&tex); value_free(&sep); runtime_error(vm, line, "SEVER expects a text value"); return value_emp(); }
+        char *seps = value_to_cstr(sep);
+        if (seps[0] == '\0') { free(seps); value_free(&tex); value_free(&sep); runtime_error(vm, line, "SEVER separator must not be empty"); return value_emp(); }
+        Value out = value_coll_empty();
+        char *p = tex.tex ? tex.tex : "";
+        char *end = p + strlen(p);
+        while (p <= end) {
+            char *hit = strstr(p, seps);
+            size_t clen = hit ? (size_t)(hit - p) : (size_t)(end - p);
+            char *part = malloc(clen + 1);
+            memcpy(part, p, clen);
+            part[clen] = '\0';
+            value_coll_push(&out, value_tex(part));
+            free(part);
+            if (!hit) break;
+            p = hit + strlen(seps);
+        }
+        free(seps);
+        value_free(&tex);
+        value_free(&sep);
+        return out;
+    }
+    case CMD_CUT: {
+        if (a->count != 1) runtime_error(vm, line, "CUT expects 1 operand");
+        Value v = eval_expr(vm, a->items[0]);
+        if (v.type != VAL_TEX) { value_free(&v); runtime_error(vm, line, "CUT expects a text value"); return value_emp(); }
+        char *t = strdup(v.tex ? v.tex : "");
+        char *trimmed = astr_trim(t);
+        value_free(&v);
+        Value res = value_tex(trimmed);
+        free(t);
+        return res;
+    }
+    case CMD_RAISE:
+    case CMD_LOWER: {
+        if (a->count != 1) runtime_error(vm, line, "%s expects 1 operand", kind == CMD_RAISE ? "RAISE" : "LOWER");
+        Value v = eval_expr(vm, a->items[0]);
+        if (v.type != VAL_TEX) { value_free(&v); runtime_error(vm, line, "%s expects a text value", kind == CMD_RAISE ? "RAISE" : "LOWER"); return value_emp(); }
+        char *t = strdup(v.tex ? v.tex : "");
+        astr_map_case(t, kind == CMD_RAISE);
+        value_free(&v);
+        Value res = value_tex(t);
+        free(t);
+        return res;
+    }
+    case CMD_UNSEAL: {
+        if (a->count < 1 || a->count > 2) runtime_error(vm, line, "UNSEAL expects 1-2 operands: path, mode");
+        Value p = eval_expr(vm, a->items[0]);
+        char *path = value_to_cstr(p);
+        value_free(&p);
+        const char *mode = "r";
+        char modebuf[4];
+        if (a->count == 2) {
+            Value mv2 = eval_expr(vm, a->items[1]);
+            char *ms = value_to_cstr(mv2);
+            value_free(&mv2);
+            if (strcmp(ms, "r") == 0) mode = "r";
+            else if (strcmp(ms, "w") == 0) mode = "w";
+            else if (strcmp(ms, "a") == 0) mode = "a";
+            else if (strcmp(ms, "rw") == 0) mode = "r+";
+            else { char bad[16]; snprintf(bad, sizeof(bad), "%s", ms); free(path); free(ms); runtime_error(vm, line, "invalid file mode '%s'", bad); return value_emp(); }
+            snprintf(modebuf, sizeof(modebuf), "%s", mode);
+            free(ms);
+        } else {
+            snprintf(modebuf, sizeof(modebuf), "%s", mode);
+        }
+        FILE *f = fopen(path, mode);
+        if (!f) { char bad[4096]; snprintf(bad, sizeof(bad), "%s", path); free(path); runtime_error(vm, line, "UNSEAL failed on '%s'", bad); return value_emp(); }
+        free(path);
+        Value v = value_file(f);
+        v.file_mode = strdup(modebuf);
+        return v;
+    }
+    case CMD_SEAL: {
+        if (a->count != 1) runtime_error(vm, line, "SEAL expects 1 operand: file");
+        Value f = eval_expr(vm, a->items[0]);
+        if (f.type != VAL_FILE || !f.file) { value_free(&f); runtime_error(vm, line, "SEAL expects a file value"); return value_emp(); }
+        fclose(f.file);
+        f.file = NULL;
+        value_free(&f);
+        return value_emp();
+    }
+    case CMD_DRAW: {
+        if (a->count < 1 || a->count > 2) runtime_error(vm, line, "DRAW expects 1-2 operands: file, count");
+        Value f = eval_expr(vm, a->items[0]);
+        if (f.type != VAL_FILE || !f.file) { value_free(&f); runtime_error(vm, line, "DRAW expects an open file"); return value_emp(); }
+        long limit = -1;
+        if (a->count == 2) {
+            Value cv = eval_expr(vm, a->items[1]);
+            limit = value_as_long(cv);
+            value_free(&cv);
+        }
+        size_t cap = 4096, len = 0;
+        char *buf = malloc(cap);
+        int ch;
+        while ((limit < 0 || (long)len < limit) && (ch = fgetc(f.file)) != EOF) {
+            if (len + 2 > cap) { cap *= 2; buf = realloc(buf, cap); }
+            buf[len++] = (char)ch;
+        }
+        buf[len] = '\0';
+        value_free(&f);
+        Value res = value_tex(buf);
+        free(buf);
+        return res;
+    }
+    case CMD_PUT: {
+        if (a->count != 2) runtime_error(vm, line, "PUT expects 2 operands: file, text");
+        Value f = eval_expr(vm, a->items[0]);
+        Value t = eval_expr(vm, a->items[1]);
+        if (f.type != VAL_FILE || !f.file) { value_free(&f); value_free(&t); runtime_error(vm, line, "PUT expects an open file"); return value_emp(); }
+        if (!f.file_mode || (strcmp(f.file_mode, "r") == 0)) { value_free(&f); value_free(&t); runtime_error(vm, line, "PUT: file is not open for writing"); return value_emp(); }
+        char *s = value_to_cstr(t);
+        size_t n = strlen(s);
+        int ok = fwrite(s, 1, n, f.file) == n;
+        free(s);
+        value_free(&f);
+        value_free(&t);
+        if (!ok) runtime_error(vm, line, "PUT write failed");
+        return value_emp();
+    }
+    case CMD_MOVE: {
+        if (a->count != 2) runtime_error(vm, line, "MOVE expects 2 operands: file, position");
+        Value f = eval_expr(vm, a->items[0]);
+        Value pv = eval_expr(vm, a->items[1]);
+        if (f.type != VAL_FILE || !f.file) { value_free(&f); value_free(&pv); runtime_error(vm, line, "MOVE expects an open file"); return value_emp(); }
+        long pos = value_as_long(pv);
+        if (pos < 0 || fseek(f.file, pos, SEEK_SET) != 0) { value_free(&f); value_free(&pv); runtime_error(vm, line, "MOVE position %ld invalid", pos); return value_emp(); }
+        value_free(&f);
+        value_free(&pv);
+        return value_emp();
+    }
+    case CMD_MAKE:
+    case CMD_RECALL:
+    case CMD_CLONE:
+    case CMD_DELIVER: {
+        const char *cmdname = kind == CMD_MAKE ? "MAKE" : kind == CMD_RECALL ? "RECALL" : kind == CMD_CLONE ? "CLONE" : "DELIVER";
+        int needs = (kind == CMD_MAKE) ? 1 : 2;
+        if (a->count != needs) runtime_error(vm, line, "%s expects %d operands", cmdname, needs);
+        char *p1, *p2 = NULL;
+        {
+            Value v1 = eval_expr(vm, a->items[0]);
+            p1 = value_to_cstr(v1);
+            value_free(&v1);
+        }
+        if (needs == 2) {
+            Value v2 = eval_expr(vm, a->items[1]);
+            p2 = value_to_cstr(v2);
+            value_free(&v2);
+        }
+        int ok;
+        if (kind == CMD_MAKE) {
+            FILE *f = fopen(p1, "w");
+            ok = f != NULL;
+            if (f) fclose(f);
+        } else if (kind == CMD_RECALL) {
+            ok = rename(p1, p2) == 0;
+        } else if (kind == CMD_CLONE || kind == CMD_DELIVER) {
+            FILE *src = fopen(p1, "rb");
+            FILE *dst = fopen(p2, "wb");
+            if (!src || !dst) { if (src) fclose(src); if (dst) fclose(dst); ok = 0; }
+            else {
+                char buf[8192]; size_t got;
+                ok = 1;
+                while ((got = fread(buf, 1, sizeof(buf), src)) > 0)
+                    if (fwrite(buf, 1, got, dst) != got) { ok = 0; break; }
+                fclose(src); fclose(dst);
+                if (ok && kind == CMD_DELIVER) remove(p1);
+            }
+        } else ok = 0;
+        if (!ok) runtime_error(vm, line, "%s failed on '%s'", cmdname, p1);
+        free(p1);
+        free(p2);
+        return value_emp();
+    }
+    case CMD_SPAWN: {
+        if (a->count != 1) runtime_error(vm, line, "SPAWN expects a job call");
+        return spawn_from_call(vm, a->items[0], line);
+    }
+    case CMD_HOLD: {
+        if (a->count != 1) runtime_error(vm, line, "HOLD expects a task or milliseconds");
+        ASTNode *op = a->items[0];
+        Value *stored = NULL;
+        if (resolve_task_lvalue(vm, op, line, &stored)) {
+            task_run(vm, stored, line);
+            return value_emp();
+        }
+        Value t = eval_expr(vm, op);
+        if (t.type == VAL_TASK) {
+            task_run(vm, &t, line);
+        } else if (value_is_numeric(t)) {
+            long ms = value_as_long(t);
+            struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+        } else {
+            value_free(&t);
+            runtime_error(vm, line, "HOLD expects a task or a numeric time in milliseconds");
+            return value_emp();
+        }
+        value_free(&t);
+        return value_emp();
+    }
+    case CMD_CLAIM: {
+        if (a->count != 1) runtime_error(vm, line, "CLAIM expects a task");
+        ASTNode *op = a->items[0];
+        Value *stored = NULL;
+        if (resolve_task_lvalue(vm, op, line, &stored)) {
+            task_run(vm, stored, line);
+            return value_copy(*stored->task_result);
+        }
+        Value t = eval_expr(vm, op);
+        if (t.type != VAL_TASK) { value_free(&t); runtime_error(vm, line, "CLAIM expects a task value"); return value_emp(); }
+        task_run(vm, &t, line);
+        Value result = t.task_result ? value_copy(*t.task_result) : value_emp();
+        value_free(&t);
+        return result;
+    }
+    case CMD_HALT: {
+        if (a->count != 1) runtime_error(vm, line, "HALT expects a task");
+        ASTNode *op = a->items[0];
+        Value *stored = NULL;
+        if (resolve_task_lvalue(vm, op, line, &stored)) {
+            stored->task_state = TASK_CANCELLED;
+            return value_emp();
+        }
+        Value t = eval_expr(vm, op);
+        if (t.type != VAL_TASK) { value_free(&t); runtime_error(vm, line, "HALT expects a task value"); return value_emp(); }
+        t.task_state = TASK_CANCELLED;
+        value_free(&t);
+        return value_emp();
+    }
+    case CMD_SEIZE: {
+        if (a->count != 1) runtime_error(vm, line, "SEIZE expects a lock");
+        Value l = eval_expr(vm, a->items[0]);
+        if (l.type != VAL_LOCK) { value_free(&l); runtime_error(vm, line, "SEIZE expects a lock value"); return value_emp(); }
+        ((Value*)&l)->lock_held = 1;
+        value_free(&l);
+        return value_emp();
+    }
+    case CMD_RELEASE: {
+        if (a->count != 1) runtime_error(vm, line, "RELEASE expects a lock");
+        Value l = eval_expr(vm, a->items[0]);
+        if (l.type != VAL_LOCK) { value_free(&l); runtime_error(vm, line, "RELEASE expects a lock value"); return value_emp(); }
+        if (!l.lock_held) { value_free(&l); runtime_error(vm, line, "RELEASE: lock is not held (only the owner may release)"); return value_emp(); }
+        ((Value*)&l)->lock_held = 0;
+        value_free(&l);
+        return value_emp();
+    }
+    case CMD_ALIGN: {
+        if (a->count != 1) runtime_error(vm, line, "ALIGN expects a barrier");
+        Value b = eval_expr(vm, a->items[0]);
+        if (b.type != VAL_LOCK) { value_free(&b); runtime_error(vm, line, "ALIGN expects a barrier value"); return value_emp(); }
+        value_free(&b);
+        return value_emp();
+    }
+    case CMD_ARM:
+    case CMD_DISARM:
+    case CMD_FIRE:
+    case CMD_KILL:
+    case CMD_SCREEN: {
+        int min = (kind == CMD_SCREEN) ? 2 : 1;
+        if (a->count < min) runtime_error(vm, line, "this command expects at least %d operands", min);
+        Value ev = eval_expr(vm, a->items[0]);
+        if (ev.type != VAL_EVENT || ev.event_id < 0 || ev.event_id >= vm->handler_count) { value_free(&ev); runtime_error(vm, line, "invalid event handle"); return value_emp(); }
+        Handler *h = &vm->handlers[ev.event_id];
+        if (kind == CMD_ARM) h->enabled = 1;
+        else if (kind == CMD_DISARM) h->enabled = 0;
+        else if (kind == CMD_KILL) h->killed = 1;
+        else if (kind == CMD_SCREEN) {
+            Value sv = eval_expr(vm, a->items[1]);
+            value_free(&sv);
+            h->screen = a->items[1];
+        } else { /* CMD_FIRE */
+            h->last_state = 0;
+            enqueue(vm, ev.event_id, 0, value_emp(), value_emp());
+        }
+        value_free(&ev);
+        return value_emp();
+    }
+    case CMD_RANK: {
+        if (a->count != 2) runtime_error(vm, line, "RANK expects 2 operands: event, priority");
+        Value ev = eval_expr(vm, a->items[0]);
+        if (ev.type != VAL_EVENT || ev.event_id < 0 || ev.event_id >= vm->handler_count) { value_free(&ev); runtime_error(vm, line, "invalid event handle"); return value_emp(); }
+        Value rv = eval_expr(vm, a->items[1]);
+        vm->handlers[ev.event_id].rank = (int)value_as_long(rv);
+        value_free(&rv);
+        value_free(&ev);
+        return value_emp();
+    }
+    case CMD_LINK: {
+        if (a->count != 2) runtime_error(vm, line, "LINK expects 2 operands: event, event");
+        Value e1 = eval_expr(vm, a->items[0]);
+        Value e2 = eval_expr(vm, a->items[1]);
+        if (e1.type != VAL_EVENT || e1.event_id < 0 || e1.event_id >= vm->handler_count ||
+            e2.type != VAL_EVENT || e2.event_id < 0 || e2.event_id >= vm->handler_count) {
+            value_free(&e1); value_free(&e2); runtime_error(vm, line, "invalid event handle"); return value_emp();
+        }
+        vm->handlers[e1.event_id].linked_to = e2.event_id;
+        value_free(&e1); value_free(&e2);
+        return value_emp();
+    }
+    }
+    runtime_error(vm, line, "unknown command");
+    return value_emp();
+}
+
 static Value eval_expr(VM *vm, ASTNode *node) {
     if (!node) return value_emp();
     switch (node->type) {
@@ -1300,12 +2022,79 @@ static Value eval_expr(VM *vm, ASTNode *node) {
             Value idxv = eval_expr(vm, node->as.index_expr.index);
             long i = value_as_long(idxv);
             value_free(&idxv);
+            if (arr.type == VAL_TEX) {
+                long len = (long)strlen(arr.tex ? arr.tex : "");
+                if (i < 0 || i >= len) { value_free(&arr); runtime_error(vm, node->line, "index %ld out of bounds", i); }
+                char ch[2] = { arr.tex[i], '\0' };
+                value_free(&arr);
+                return value_tex(ch);
+            }
             if (arr.type != VAL_COLL) { value_free(&arr); runtime_error(vm, node->line, "cannot index a non-collection value"); }
             if (i < 0 || i >= arr.count) { value_free(&arr); runtime_error(vm, node->line, "index %ld out of bounds", i); }
             Value out = value_copy(arr.items[i]);
             value_free(&arr);
             return out;
         }
+
+        case NODE_SLICE: {
+            Value arr = eval_expr(vm, node->as.slice_expr.array);
+            Value startv = eval_expr(vm, node->as.slice_expr.start);
+            Value endv = eval_expr(vm, node->as.slice_expr.end);
+            long len = (arr.type == VAL_TEX) ? (long)strlen(arr.tex ? arr.tex : "") : (arr.type == VAL_COLL) ? arr.count : 0;
+            long start = (startv.type == VAL_EMP) ? 0 : value_as_long(startv);
+            long end = (endv.type == VAL_EMP) ? len : value_as_long(endv);
+            value_free(&startv); value_free(&endv);
+            if (start < 0 || end < start || end > len) {
+                value_free(&arr);
+                runtime_error(vm, node->line, "invalid slice [%ld:%ld] (length %ld)", start, end, len);
+            }
+            if (arr.type == VAL_TEX) {
+                char *sub = malloc((size_t)(end - start) + 1);
+                memcpy(sub, arr.tex + start, (size_t)(end - start));
+                sub[end - start] = '\0';
+                value_free(&arr);
+                Value res = value_tex(sub);
+                free(sub);
+                return res;
+            }
+            if (arr.type != VAL_COLL) { value_free(&arr); runtime_error(vm, node->line, "cannot slice a non-collection, non-text value"); }
+            Value out = value_coll_empty();
+            for (long i = start; i < end; i++) value_coll_push(&out, value_copy(arr.items[i]));
+            value_free(&arr);
+            return out;
+        }
+
+        case NODE_TEX_INTERP: {
+            size_t cap = 64, len = 0;
+            char *out = malloc(cap);
+            out[0] = '\0';
+            for (int i = 0; i < node->as.tex_interp.parts.count; i++) {
+                ASTNode *part = node->as.tex_interp.parts.items[i];
+                char *piece;
+                if (part->type == NODE_INTERP_LITERAL)
+                    piece = strdup(part->as.interp_lit.text ? part->as.interp_lit.text : "");
+                else {
+                    Value v = eval_expr(vm, part);
+                    piece = value_to_cstr(v);
+                    value_free(&v);
+                }
+                size_t plen = strlen(piece);
+                while (len + plen + 1 > cap) { cap *= 2; out = realloc(out, cap); }
+                memcpy(out + len, piece, plen);
+                len += plen;
+                out[len] = '\0';
+                free(piece);
+            }
+            Value result = value_tex(out);
+            free(out);
+            return result;
+        }
+
+        case NODE_INTERP_LITERAL:
+            return value_tex(node->as.interp_lit.text ? node->as.interp_lit.text : "");
+
+        case NODE_COMMAND:
+            return exec_command(vm, node);
 
         case NODE_MODULE_REF: {
             /* module.member value reference - resolve to module member variable */
@@ -1325,8 +2114,6 @@ static Value eval_expr(VM *vm, ASTNode *node) {
 
         case NODE_CALL: {
             JobEntry *job = NULL;
-            int saved_active_module = vm->active_module;
-            int call_active_module = -1;
 
             if (node->as.call.callee->type == NODE_MODULE_REF) {
                 /* Module-member call: math.ADD(...) */
@@ -1339,7 +2126,6 @@ static Value eval_expr(VM *vm, ASTNode *node) {
                 if (!mm->job_internal) runtime_error(vm, node->line, "module '%s' job '%s' not found (internal error)", mod_name, member_name);
                 job = job_find_by_name(vm, mm->job_internal);
                 if (!job) runtime_error(vm, node->line, "internal job '%s' not found", mm->job_internal);
-                call_active_module = module_find(vm, mod_name) - vm->modules;
             } else if (node->as.call.callee->type == NODE_IDENTIFIER) {
                 /* Direct call - could be a bare call to a sibling job inside
                    the same module (SHIPped or not - SHIP only controls
@@ -1354,7 +2140,6 @@ static Value eval_expr(VM *vm, ASTNode *node) {
                     char qualified[128];
                     snprintf(qualified, sizeof(qualified), "%s#%s", mod->name, job_name);
                     job = job_find_by_name(vm, qualified);
-                    if (job) call_active_module = vm->active_module;
                 }
                 if (!job) job = job_find_by_name(vm, job_name);
                 if (!job) runtime_error(vm, node->line, "undefined job '%s'", job_name);
@@ -1372,40 +2157,9 @@ static Value eval_expr(VM *vm, ASTNode *node) {
             for (int i = 0; i < nargs; i++)
                 args[i] = eval_expr(vm, node->as.call.args.items[i]);
 
-            /* Save VM state */
-            Scope *saved_scope = vm->scope;
-            int saved_giving = vm->giving;
-            Value saved_give = vm->give_value;
-            vm->giving = 0;
+            Value result = call_job(vm, job->name, args, nargs, node->line);
 
-            /* Push scope, bind params as VMA-backed variables */
-            vm->scope = scope_push(saved_scope);
-            for (int i = 0; i < nargs; i++) {
-                RVmaSlot *slot = rvma_alloc_next(&vm->vmas, job->params[i].name);
-                Symbol *sym = scope_declare(vm->scope, job->params[i].name);
-                snprintf(sym->vma, sizeof(sym->vma), "%s", slot->address);
-                value_free(&slot->value);
-                slot->value = args[i];
-            }
-
-            /* Set active module for this job execution */
-            vm->active_module = call_active_module;
-
-            /* Run the job body */
-            run_range(vm, job->body_start);
-
-            /* Get result */
-            Value result = vm->giving ? vm->give_value : value_emp();
-
-            /* Restore state */
-            vm->give_value = saved_give;
-            vm->giving = saved_giving;
-            vm->active_module = saved_active_module;
-
-            /* Pop scope (frees param VMAs via AUTOCLEAN if set) */
-            scope_pop_with_autoclean(vm);
-
-            /* Free args array (values are now in VMAs or copied) */
+            for (int i = 0; i < nargs; i++) value_free(&args[i]);
             free(args);
 
             return result;
@@ -1427,6 +2181,10 @@ static Value default_value_for_type(VOTokenType t) {
         case TOKEN_TYPE_YN:  return value_yn(0);
         case TOKEN_TYPE_COLL: return value_coll_empty();
         case TOKEN_TYPE_EMP: return value_emp();
+        case TOKEN_TYPE_FILE: { Value v = {0}; v.type = VAL_FILE; v.file = NULL; return v; }
+        case TOKEN_TYPE_TASK: { Value v = {0}; v.type = VAL_TASK; v.task_state = TASK_PENDING; return v; }
+        case TOKEN_TYPE_LOCK: { Value v = {0}; v.type = VAL_LOCK; v.lock_held = 0; return v; }
+        case TOKEN_TYPE_EVENT: { Value v = {0}; v.type = VAL_EVENT; v.event_id = -1; return v; }
         default: return value_emp();
     }
 }
@@ -1517,22 +2275,31 @@ static void exec_simple_stmt(VM *vm, ASTNode *node) {
             value_free(&v);
             break;
         }
+        case NODE_COMMAND: {
+            Value v = exec_command(vm, node);
+            value_free(&v);
+            break;
+        }
         case NODE_INC_DEC_STMT: {
             VOTokenType op = node->as.inc_dec.op == TOKEN_INCREMENT ? TOKEN_PLUS_ASSIGN : TOKEN_MINUS_ASSIGN;
             do_assign(vm, node->as.inc_dec.target, op, value_num(1), node->line);
             break;
         }
         case NODE_SHOW_STMT: {
-            Value v = eval_expr(vm, node->as.show_stmt.expr);
-            char *s = value_to_cstr(v);
-            printf("%s\n", s);
-            free(s);
-            value_free(&v);
+            for (int i = 0; i < node->as.show_stmt.expr.count; i++) {
+                Value v = eval_expr(vm, node->as.show_stmt.expr.items[i]);
+                char *s = value_to_cstr(v);
+                if (i > 0) printf(" ");
+                printf("%s", s);
+                free(s);
+                value_free(&v);
+            }
+            printf("\n");
             break;
         }
-        case NODE_STORE_STMT: {
+case NODE_STORE_STMT: {
             Value v = eval_expr(vm, node->as.store_stmt.value);
-            rvma_set(vm, node->as.store_stmt.target_vma, v, node->line);
+            rvma_set(vm, resolve_name_to_vma(vm, node->as.store_stmt.target_vma), v, node->line);
             break;
         }
         case NODE_CLEAN_STMT:
@@ -1587,11 +2354,15 @@ static void exec_simple_stmt(VM *vm, ASTNode *node) {
                             /* Execute each statement directly */
                             switch (stmt->type) {
                                 case NODE_SHOW_STMT: {
-                                    Value v = eval_expr(vm, stmt->as.show_stmt.expr);
-                                    char *s = value_to_cstr(v);
-                                    printf("%s\n", s);
-                                    free(s);
-                                    value_free(&v);
+                                    for (int i = 0; i < stmt->as.show_stmt.expr.count; i++) {
+                                        Value v = eval_expr(vm, stmt->as.show_stmt.expr.items[i]);
+                                        char *s = value_to_cstr(v);
+                                        if (i > 0) printf(" ");
+                                        printf("%s", s);
+                                        free(s);
+                                        value_free(&v);
+                                    }
+                                    printf("\n");
                                     break;
                                 }
                                 case NODE_EXPR_STMT: {
@@ -1646,11 +2417,15 @@ static void exec_simple_stmt(VM *vm, ASTNode *node) {
                         if (!stmt) continue;
                         switch (stmt->type) {
                             case NODE_SHOW_STMT: {
-                                Value v = eval_expr(vm, stmt->as.show_stmt.expr);
-                                char *s = value_to_cstr(v);
-                                printf("%s\n", s);
-                                free(s);
-                                value_free(&v);
+                                for (int i = 0; i < stmt->as.show_stmt.expr.count; i++) {
+                                    Value v = eval_expr(vm, stmt->as.show_stmt.expr.items[i]);
+                                    char *s = value_to_cstr(v);
+                                    if (i > 0) printf(" ");
+                                    printf("%s", s);
+                                    free(s);
+                                    value_free(&v);
+                                }
+                                printf("\n");
                                 break;
                             }
                             case NODE_EXPR_STMT: {
@@ -1758,11 +2533,18 @@ static void register_handler(VM *vm, Instr *ins) {
     Handler *h = &vm->handlers[vm->handler_count++];
     memset(h, 0, sizeof(*h));
     h->kind = node->as.when_stmt.kind;
-    if (h->kind == WHEN_VMA_CHANGED)
-        snprintf(h->vma_addr, sizeof(h->vma_addr), "%s", node->as.when_stmt.vma_name);
+if (h->kind == WHEN_VMA_CHANGED) {
+        const char *addr = resolve_name_to_vma(vm, node->as.when_stmt.vma_name);
+        snprintf(h->vma_addr, sizeof(h->vma_addr), "%s", addr ? addr : node->as.when_stmt.vma_name);
+    }
     else
         h->condition = node->as.when_stmt.condition;
     h->body_start = ins->target2;
+    h->enabled = 1;
+    h->rank = 0;
+    h->killed = 0;
+    h->linked_to = -1;
+    h->screen = NULL;
 }
 
 static int step(VM *vm, int pc) {
@@ -1834,8 +2616,17 @@ static void drain_queue(VM *vm) {
             value_free(&vm->cur_new_value);
         }
         vm->in_changed_handler = 0;
+
+        /* LINK: when this event fires, the linked event is queued too */
+        if (h->linked_to >= 0 && h->linked_to < vm->handler_count) {
+            Handler *lh = &vm->handlers[h->linked_to];
+            if (lh->enabled && !lh->killed) {
+                lh->last_state = 0;
+                enqueue(vm, h->linked_to, 0, value_emp(), value_emp());
+            }
+        }
     }
-}
+} /* drain_queue */
 
 /* =======================================================================
  * Public entry point
@@ -1857,12 +2648,9 @@ int run_program(ASTNode *program, const char *source_path) {
     Compiler c;
     InstrList code;
     /* module_load() (called from inside compile_program, while resolving
-       BRING) reports failures via runtime_error(), which longjmps rather
-       than returning normally - so that failure has to be caught by a
-       setjmp established *before* compile_program runs, not just handled
-       via c.had_error afterward. compile_program() zeroes both `c` and
-       `code` before doing anything else, so if we do land back here via
-       longjmp, freeing their (NULL) fields below is always safe. */
+       BRING) reports failures via runtime_error(), which terminates the
+       process (exit(1)) so that vm/c are never leaked. The setjmp below is
+       retained for safety but is no longer reachable from runtime_error. */
     if (setjmp(vm->abort_buf)) {
         free(code.items);
         for (int i = 0; i < c.label_count; i++) free(c.labels[i].name);
@@ -1894,7 +2682,7 @@ int run_program(ASTNode *program, const char *source_path) {
         free(vm);
         return 1;
     }
-    vm->code = code.items;
+vm->code = code.items;
     vm->code_count = code.count;
     vm->jobs = c.jobs;
     vm->job_count = c.job_count;
@@ -1917,7 +2705,7 @@ int run_program(ASTNode *program, const char *source_path) {
         free(vm);
         return 1;
     }
-    for (int m = 0; m < vm->module_count; m++) {
+for (int m = 0; m < vm->module_count; m++) {
         Module *mod = &vm->modules[m];
         if (mod->loaded) {
             module_initialize(vm, mod);
@@ -1925,6 +2713,8 @@ int run_program(ASTNode *program, const char *source_path) {
     }
 
     vm->scope = scope_push(NULL);
+    vm->active_module = -1;
+    vm->initializing_module = -1;
 
     int pc = 0;
     while (pc >= 0 && pc < vm->code_count) {
@@ -1959,3 +2749,5 @@ int run_program(ASTNode *program, const char *source_path) {
     free(vm);
     return rc;
 }
+
+void dbg_mark(const char *m) { fprintf(stderr, "DBG %s\n", m); }

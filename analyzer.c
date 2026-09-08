@@ -335,9 +335,15 @@ static void collect_jobs(ASTNode *node, Analyzer *a) {
             break;
         case NODE_BLOCK:
         case NODE_PROGRAM:
-        case NODE_PEICE_DECL:
             for (int i = 0; i < node->as.block.statements.count; i++)
                 collect_jobs(node->as.block.statements.items[i], a);
+            break;
+        case NODE_PEICE_DECL:
+            /* PEICE is NOT a block node: its body is a separate BLOCK node
+               (union field peice_decl.body). Reading as.block.statements on
+               the PEICE node reinterprets name/body pointers as a NodeList
+               (garbage count from a heap address -> random crashes). */
+            collect_jobs(node->as.peice_decl.body, a);
             break;
         case NODE_IF_STMT:
             for (int i = 0; i < node->as.if_stmt.branches.count; i++)
@@ -420,6 +426,246 @@ static void analyze_write_target(Analyzer *a, ASTNode *target) {
     }
 }
 
+static const char *command_kind_name(CommandKind kind) {
+    switch (kind) {
+        case CMD_ATTACH:   return "ATTACH";
+        case CMD_PLACE:    return "PLACE";
+        case CMD_ERASE:    return "ERASE";
+        case CMD_COUNT:    return "COUNT";
+        case CMD_TAKE:     return "TAKE";
+        case CMD_SEEK:     return "SEEK";
+        case CMD_HAS:      return "HAS";
+        case CMD_BIND:     return "BIND";
+        case CMD_SEVER:    return "SEVER";
+        case CMD_CUT:      return "CUT";
+        case CMD_RAISE:    return "RAISE";
+        case CMD_LOWER:    return "LOWER";
+        case CMD_UNSEAL:   return "UNSEAL";
+        case CMD_SEAL:     return "SEAL";
+        case CMD_DRAW:     return "DRAW";
+        case CMD_PUT:      return "PUT";
+        case CMD_MOVE:     return "MOVE";
+        case CMD_MAKE:     return "MAKE";
+        case CMD_RECALL:   return "RECALL";
+        case CMD_CLONE:    return "CLONE";
+        case CMD_DELIVER:  return "DELIVER";
+        case CMD_SPAWN:    return "SPAWN";
+        case CMD_HOLD:     return "HOLD";
+        case CMD_CLAIM:    return "CLAIM";
+        case CMD_HALT:     return "HALT";
+        case CMD_SEIZE:    return "SEIZE";
+        case CMD_RELEASE:  return "RELEASE";
+        case CMD_ALIGN:    return "ALIGN";
+        case CMD_ARM:      return "ARM";
+        case CMD_DISARM:   return "DISARM";
+        case CMD_FIRE:     return "FIRE";
+        case CMD_RANK:     return "RANK";
+        case CMD_KILL:     return "KILL";
+        case CMD_SCREEN:   return "SCREEN";
+        case CMD_LINK:     return "LINK";
+    }
+    return "COMMAND";
+}
+
+/* Operand arity per spec sec. 27/31-36/40-60, matching exec_command(). */
+static int command_min_max(CommandKind kind, int *min_out, int *max_out) {
+    switch (kind) {
+        case CMD_ATTACH:   *min_out = 2; *max_out = 2; break;
+        case CMD_PLACE:    *min_out = 3; *max_out = 3; break;
+        case CMD_ERASE:    *min_out = 1; *max_out = 2; break;
+        case CMD_COUNT:    *min_out = 1; *max_out = 1; break;
+        case CMD_TAKE:     *min_out = 1; *max_out = 1; break;
+        case CMD_SEEK:     *min_out = 2; *max_out = 2; break;
+        case CMD_HAS:      *min_out = 1; *max_out = 2; break;
+        case CMD_BIND:     *min_out = 2; *max_out = 2; break;
+        case CMD_SEVER:    *min_out = 2; *max_out = 2; break;
+        case CMD_CUT:      *min_out = 1; *max_out = 1; break;
+        case CMD_RAISE:    *min_out = 1; *max_out = 1; break;
+        case CMD_LOWER:    *min_out = 1; *max_out = 1; break;
+        case CMD_UNSEAL:   *min_out = 1; *max_out = 2; break;
+        case CMD_SEAL:     *min_out = 1; *max_out = 1; break;
+        case CMD_DRAW:     *min_out = 1; *max_out = 2; break;
+        case CMD_PUT:      *min_out = 2; *max_out = 2; break;
+        case CMD_MOVE:     *min_out = 2; *max_out = 2; break;
+        case CMD_MAKE:     *min_out = 1; *max_out = 1; break;
+        case CMD_RECALL:   *min_out = 2; *max_out = 2; break;
+        case CMD_CLONE:    *min_out = 2; *max_out = 2; break;
+        case CMD_DELIVER:  *min_out = 2; *max_out = 2; break;
+        case CMD_SPAWN:    *min_out = 1; *max_out = 1; break;
+        case CMD_HOLD:     *min_out = 1; *max_out = 1; break;
+        case CMD_CLAIM:    *min_out = 1; *max_out = 1; break;
+        case CMD_HALT:     *min_out = 1; *max_out = 1; break;
+        case CMD_SEIZE:    *min_out = 1; *max_out = 1; break;
+        case CMD_RELEASE:  *min_out = 1; *max_out = 1; break;
+        case CMD_ALIGN:    *min_out = 1; *max_out = 1; break;
+        case CMD_ARM:      *min_out = 1; *max_out = 1; break;
+        case CMD_DISARM:   *min_out = 1; *max_out = 1; break;
+        case CMD_FIRE:     *min_out = 1; *max_out = 1; break;
+        case CMD_KILL:     *min_out = 1; *max_out = 1; break;
+        case CMD_SCREEN:   *min_out = 2; *max_out = 2; break;
+        case CMD_RANK:     *min_out = 2; *max_out = 2; break;
+        case CMD_LINK:     *min_out = 2; *max_out = 2; break;
+        default: return 0;
+    }
+    return 1;
+}
+
+/* Best-effort static type of an expression: literals and declared
+   identifiers only. Unknown expressions (calls, commands, slices) and EMP
+   (variant) return -1 / skip so the runtime decides. */
+static VOTokenType expr_static_type(Analyzer *a, ASTNode *node) {
+    if (!node) return (VOTokenType)-1;
+    switch (node->type) {
+        case NODE_IDENTIFIER: {
+            Symbol *sym = scope_resolve(a->scope, node->as.identifier.name);
+            return sym ? sym->var_type : (VOTokenType)-1;
+        }
+        case NODE_ARRAY_LITERAL: return TOKEN_TYPE_COLL;
+        case NODE_TEX_LITERAL:   return TOKEN_TYPE_TEX;
+        case NODE_NUM_LITERAL:   return TOKEN_TYPE_NUM;
+        case NODE_DEC_LITERAL:   return TOKEN_TYPE_DEC;
+        case NODE_BOOL_LITERAL:  return TOKEN_TYPE_YN;
+        case NODE_EMP_LITERAL:   return TOKEN_TYPE_EMP;
+        default: return (VOTokenType)-1;
+    }
+}
+
+static const char *type_display_name(VOTokenType t) {
+    switch (t) {
+        case TOKEN_TYPE_NUM:   return "NUM";
+        case TOKEN_TYPE_DEC:   return "DEC";
+        case TOKEN_TYPE_TEX:   return "TEX";
+        case TOKEN_TYPE_YN:    return "YN";
+        case TOKEN_TYPE_COLL:  return "COLL";
+        case TOKEN_TYPE_EMP:   return "EMP";
+        case TOKEN_TYPE_FILE:  return "FILE";
+        case TOKEN_TYPE_TASK:  return "TASK";
+        case TOKEN_TYPE_LOCK:  return "LOCK";
+        case TOKEN_TYPE_EVENT: return "EVENT";
+        default: return "value";
+    }
+}
+
+static void check_command_operand_type(Analyzer *a, CommandKind kind,
+                                       ASTNode *operand, int position,
+                                       VOTokenType expected, VOTokenType alt) {
+    VOTokenType t = expr_static_type(a, operand);
+    if (t == (VOTokenType)-1 || t == TOKEN_TYPE_EMP) return; /* unknown/variant */
+    if (t == expected || (alt != (VOTokenType)-1 && t == alt)) return;
+    const char *what = operand->type == NODE_IDENTIFIER
+                       ? operand->as.identifier.name : "this expression";
+    sem_error(operand->line, "%s operand %d expects a %s value but '%s' is %s",
+              command_kind_name(kind), position, type_display_name(expected),
+              what, type_display_name(t));
+    a->had_error = 1;
+}
+
+/* NODE_COMMAND validation: arity (spec sec. 27/31-36/40-60) plus
+   static-type conformance where the operand's declared type is known. */
+static void analyze_command(Analyzer *a, ASTNode *node) {
+    CommandKind kind = node->as.command.kind;
+    int min, max;
+    if (!command_min_max(kind, &min, &max)) return;
+    int n = node->as.command.args.count;
+    int line = node->line;
+
+    if (n < min || n > max) {
+        if (min == max)
+            sem_error(line, "%s expects %d operand(s) but got %d", command_kind_name(kind), min, n);
+        else
+            sem_error(line, "%s expects %d to %d operands but got %d", command_kind_name(kind), min, max, n);
+        a->had_error = 1;
+    }
+
+    for (int i = 0; i < n; i++)
+        analyze_expr(a, node->as.command.args.items[i]);
+
+    if (n < min || n > max) return; /* arity already reported */
+
+    switch (kind) {
+        case CMD_ATTACH:
+        case CMD_PLACE:
+        case CMD_BIND: {
+            ASTNode *op = node->as.command.args.items[0];
+            ASTNode *t = op;
+            if (t->type == NODE_INDEX) t = t->as.index_expr.array; /* list[0] ref */
+            check_command_operand_type(a, kind, t, 1, TOKEN_TYPE_COLL, (VOTokenType)-1);
+            break;
+        }
+        case CMD_ERASE:
+            if (n == 2) {
+                ASTNode *t = node->as.command.args.items[0];
+                if (t->type == NODE_INDEX) t = t->as.index_expr.array;
+                check_command_operand_type(a, kind, t, 1, TOKEN_TYPE_COLL, (VOTokenType)-1);
+            }
+            break;
+        case CMD_SEVER:
+        case CMD_CUT:
+        case CMD_RAISE:
+        case CMD_LOWER:
+            check_command_operand_type(a, kind, node->as.command.args.items[0], 1,
+                                       TOKEN_TYPE_TEX, (VOTokenType)-1);
+            break;
+        case CMD_SEAL:
+        case CMD_DRAW:
+        case CMD_PUT:
+        case CMD_MOVE:
+            check_command_operand_type(a, kind, node->as.command.args.items[0], 1,
+                                       TOKEN_TYPE_FILE, (VOTokenType)-1);
+            break;
+        case CMD_CLAIM:
+        case CMD_HALT:
+            check_command_operand_type(a, kind, node->as.command.args.items[0], 1,
+                                       TOKEN_TYPE_TASK, (VOTokenType)-1);
+            break;
+        case CMD_SEIZE:
+        case CMD_RELEASE:
+        case CMD_ALIGN:
+            check_command_operand_type(a, kind, node->as.command.args.items[0], 1,
+                                       TOKEN_TYPE_LOCK, (VOTokenType)-1);
+            break;
+        case CMD_ARM:
+        case CMD_DISARM:
+        case CMD_FIRE:
+        case CMD_KILL:
+        case CMD_SCREEN:
+        case CMD_RANK:
+            check_command_operand_type(a, kind, node->as.command.args.items[0], 1,
+                                       TOKEN_TYPE_EVENT, (VOTokenType)-1);
+            break;
+        case CMD_LINK:
+            check_command_operand_type(a, kind, node->as.command.args.items[0], 1,
+                                       TOKEN_TYPE_EVENT, (VOTokenType)-1);
+            check_command_operand_type(a, kind, node->as.command.args.items[1], 2,
+                                       TOKEN_TYPE_EVENT, (VOTokenType)-1);
+            break;
+        case CMD_SPAWN: {
+            ASTNode *op = node->as.command.args.items[0];
+            if (op->type == NODE_CALL) {
+                ASTNode *callee = op->as.call.callee;
+                if (callee->type == NODE_IDENTIFIER) {
+                    if (!job_lookup(a->jobs, a->job_count, callee->as.identifier.name)) {
+                        sem_error(op->line, "SPAWN references undeclared job '%s'",
+                                  callee->as.identifier.name);
+                        a->had_error = 1;
+                    }
+                } else if (callee->type == NODE_MODULE_REF) {
+                    /* module member jobs are resolved at runtime */
+                } else {
+                    sem_error(op->line, "SPAWN expects a job call");
+                    a->had_error = 1;
+                }
+            } else {
+                sem_error(op->line, "SPAWN expects a job call");
+                a->had_error = 1;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 static void analyze_expr(Analyzer *a, ASTNode *node) {
     if (!node) return;
 
@@ -482,6 +728,24 @@ static void analyze_expr(Analyzer *a, ASTNode *node) {
         case NODE_INDEX:
             analyze_expr(a, node->as.index_expr.array);
             analyze_expr(a, node->as.index_expr.index);
+            break;
+
+        case NODE_SLICE:
+            analyze_expr(a, node->as.slice_expr.array);
+            analyze_expr(a, node->as.slice_expr.start);
+            analyze_expr(a, node->as.slice_expr.end);
+            break;
+
+        case NODE_TEX_INTERP:
+            for (int i = 0; i < node->as.tex_interp.parts.count; i++)
+                analyze_expr(a, node->as.tex_interp.parts.items[i]);
+            break;
+
+        case NODE_INTERP_LITERAL:
+            break;
+
+        case NODE_COMMAND:
+            analyze_command(a, node);
             break;
 
         case NODE_CALL: {
@@ -616,9 +880,22 @@ static void scope_pop_with_autoclean(Analyzer *a) {
     free(s);
 }
 
+/* Resolve a STORE/WHEN target string: a declared variable name maps to its
+   auto-allocated VMA; a raw VMA address (e.g. "A1") is used as-is. Reports
+   and returns NULL if the name is an undeclared identifier. */
+static const char *analyzer_target_vma(Analyzer *a, const char *name, int line) {
+    Symbol *sym = scope_resolve(a->scope, name);
+    if (sym) return sym->is_loop_var ? NULL : sym->vma;
+    if (is_vma_format(name)) return name;
+    sem_error(line, "undeclared identifier '%s'", name);
+    a->had_error = 1;
+    return NULL;
+}
+
 static void analyze_when_stmt(Analyzer *a, ASTNode *node) {
     if (node->as.when_stmt.kind == WHEN_VMA_CHANGED) {
-        check_vma_access(a, node->as.when_stmt.vma_name, node->line, "read");
+        const char *addr = analyzer_target_vma(a, node->as.when_stmt.vma_name, node->line);
+        if (addr) check_vma_access(a, addr, node->line, "read");
     } else if (node->as.when_stmt.kind == WHEN_CONDITION) {
         analyze_expr(a, node->as.when_stmt.condition);
     }
@@ -677,6 +954,10 @@ static void analyze_stmt(Analyzer *a, ASTNode *node) {
             analyze_var_decl(a, node);
             break;
 
+        case NODE_COMMAND:
+            analyze_command(a, node);
+            break;
+
         case NODE_HARD_DECL:
             analyze_hard_decl(a, node);
             break;
@@ -690,13 +971,16 @@ static void analyze_stmt(Analyzer *a, ASTNode *node) {
             break;
 
         case NODE_SHOW_STMT:
-            analyze_expr(a, node->as.show_stmt.expr);
+            for (int i = 0; i < node->as.show_stmt.expr.count; i++)
+                analyze_expr(a, node->as.show_stmt.expr.items[i]);
             break;
 
-        case NODE_STORE_STMT:
+        case NODE_STORE_STMT: {
             analyze_expr(a, node->as.store_stmt.value);
-            check_vma_access(a, node->as.store_stmt.target_vma, node->line, "write");
+            const char *addr = analyzer_target_vma(a, node->as.store_stmt.target_vma, node->line);
+            if (addr) check_vma_access(a, addr, node->line, "write");
             break;
+        }
 
         case NODE_CLEAN_STMT:
             analyze_clean_stmt(a, node);

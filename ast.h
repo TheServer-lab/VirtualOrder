@@ -37,6 +37,10 @@ typedef enum {
     NODE_LENGTH_CALL,
     NODE_ARRAY_LITERAL,
     NODE_INDEX,
+    NODE_SLICE,
+    NODE_TEX_INTERP,
+    NODE_INTERP_LITERAL,
+    NODE_COMMAND,
     NODE_CALL,
     NODE_MODULE_REF,
 
@@ -77,6 +81,17 @@ typedef enum {
     WHEN_PROGRAM_START
 } WhenKind;
 
+/* Builtin command operations (v1.4) - collections, strings, files, concurrency, events */
+typedef enum {
+    CMD_ATTACH, CMD_PLACE, CMD_ERASE, CMD_COUNT, CMD_TAKE, CMD_SEEK, CMD_HAS,
+    CMD_BIND, CMD_SEVER, CMD_CUT, CMD_RAISE, CMD_LOWER,
+    CMD_UNSEAL, CMD_SEAL, CMD_DRAW, CMD_PUT, CMD_MOVE,
+    CMD_MAKE, CMD_RECALL, CMD_CLONE, CMD_DELIVER,
+    CMD_SPAWN, CMD_HOLD, CMD_CLAIM, CMD_HALT,
+    CMD_SEIZE, CMD_RELEASE, CMD_ALIGN,
+    CMD_ARM, CMD_DISARM, CMD_FIRE, CMD_RANK, CMD_KILL, CMD_SCREEN, CMD_LINK
+} CommandKind;
+
 struct ASTNode {
     NodeType type;
     int line;
@@ -99,6 +114,14 @@ struct ASTNode {
         struct { ASTNode *arg; }             length_call;
         struct { NodeList elements; }        array_lit;
         struct { ASTNode *array; ASTNode *index; } index_expr;
+        struct { ASTNode *array; ASTNode *start; ASTNode *end; } slice_expr;
+
+        /* TEX interpolation: literal text node OR expression node per part */
+        struct { NodeList parts; }           tex_interp;
+        struct { char *text; }               interp_lit;
+
+        /* generic builtin command: kind + operands */
+        struct { CommandKind kind; NodeList args; } command;
 
         /* function call: callee(args...) */
         struct {
@@ -133,7 +156,7 @@ struct ASTNode {
         /* statements */
         struct { ASTNode *expr; }            expr_stmt;
         struct { ASTNode *target; VOTokenType op; } inc_dec;
-        struct { ASTNode *expr; }            show_stmt;
+        struct { NodeList expr; }              show_stmt;
         struct { ASTNode *value; char *target_vma; } store_stmt;
         struct { char *target; }             clean_stmt;
         struct { int on; }                   autoclean_stmt;

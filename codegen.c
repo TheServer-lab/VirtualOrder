@@ -142,6 +142,7 @@ static CSym *scope_declare(CScope *s, const char *name) {
 typedef struct {
     ASTNode *decl;          /* the NODE_JOB_DECL */
     int id;
+    int tab_index;          /* position in cg->jobs[] == index in vo_job_tab */
     int param_count;
     char param_labels[16][40]; /* .bss slot for each parameter */
     char ret_label[40];        /* .bss slot holding the job's return value */
@@ -206,6 +207,7 @@ typedef struct {
     const char *source_dir;     /* directory of main source for BRING resolution */
 
     CDo *do_stack; int do_depth, do_cap;
+    int max_stack_args;     /* most stack args passed by any call (win64 spill area) */
 } CG;
 
 static void cg_error(CG *cg, int line, const char *msg) {
@@ -235,6 +237,7 @@ static CJob *cg_job_add(CG *cg, ASTNode *decl, int id, const char *lookup_name, 
     CJob *j = &cg->jobs[cg->job_count++];
     j->decl = decl;
     j->id = id;
+    j->tab_index = cg->job_count - 1;
     j->name = strdup(lookup_name);
     j->module_name = module_name ? strdup(module_name) : NULL;
     return j;
@@ -461,18 +464,37 @@ static Opnd global_opnd(const char *label) {
 }
 
 /* ---- emitting calls: dst/a/b are Opnd.text (memory operands), addr-of
-   is taken with lea; `line` args are plain immediates.                    */
+   is taken with lea; `line` args are plain immediates. Args 1-4 travel in
+   the ABI argument registers; any 5th+ are passed on the stack (pushed in
+   reverse for SysV, stored into the reserved shadow area for Win64). ---- */
 static void emit_lea(CG *cg, const char *opnd, const char *reg) {
     fprintf(cg->body, "    leaq %s, %s\n", opnd, reg);
 }
 static void call0(CG *cg, const char *fn) { fprintf(cg->body, "    call %s\n", fn); }
 
 static void callN(CG *cg, const char *fn, int n, const char *opnds[], int is_imm[]) {
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n && i < 4; i++) {
         if (is_imm[i]) fprintf(cg->body, "    movq $%s, %s\n", opnds[i], cg->abi.argreg[i]);
         else emit_lea(cg, opnds[i], cg->abi.argreg[i]);
     }
+    if (n > 4) {
+        if (cg->target == CG_TARGET_LINUX) {
+            for (int i = n - 1; i >= 4; i--) {
+                if (is_imm[i]) fprintf(cg->body, "    pushq $%s\n", opnds[i]);
+                else fprintf(cg->body, "    pushq %s\n", opnds[i]);
+            }
+        } else { /* win64: store into the already-reserved shadow + spill area */
+            for (int i = 4; i < n; i++) {
+                if (is_imm[i]) fprintf(cg->body, "    movq $%s, %d(%%rsp)\n", opnds[i], 32 + 8 * (i - 4));
+                else fprintf(cg->body, "    leaq %s, %%r11\n    movq %%r11, %d(%%rsp)\n", opnds[i], 32 + 8 * (i - 4));
+            }
+        }
+    }
     call0(cg, fn);
+    if (n > 4 && cg->target == CG_TARGET_LINUX)
+        fprintf(cg->body, "    addq $%d, %%rsp\n", (n - 4) * 8);
+    if (n > 4 && cg->target == CG_TARGET_WINDOWS && (n - 4) > cg->max_stack_args)
+        cg->max_stack_args = n - 4;
 }
 
 static void call1(CG *cg, const char *fn, const char *a0) { const char *o[1]={a0}; int im[1]={0}; callN(cg,fn,1,o,im); }
@@ -486,6 +508,10 @@ static void call4_imm(CG *cg, const char *fn, const char *a0, const char *a1, co
     char linebuf[32]; snprintf(linebuf, sizeof(linebuf), "%ld", line);
     const char *o[4]={a0,a1,a2,linebuf}; int im[4]={0,0,0,1}; callN(cg,fn,4,o,im);
 }
+static void call5_imm(CG *cg, const char *fn, const char *a0, const char *a1, const char *a2, const char *a3, long line) {
+    char linebuf[32]; snprintf(linebuf, sizeof(linebuf), "%ld", line);
+    const char *o[5]={a0,a1,a2,a3,linebuf}; int im[5]={0,0,0,0,1}; callN(cg,fn,5,o,im);
+}
 
 static void free_if_temp(CG *cg, Opnd *o) {
     if (o->is_temp) { call1(cg, "vo_free", o->text); free_temp(cg, o); }
@@ -495,6 +521,7 @@ static int new_label(CG *cg) { return cg->label_id++; }
 
 /* forward decls */
 static Opnd emit_expr(CG *cg, ASTNode *node);
+static Opnd emit_command(CG *cg, ASTNode *node);
 static void emit_stmt(CG *cg, ASTNode *node);
 static void emit_block(CG *cg, ASTNode *block);
 static void emit_give_stmt(CG *cg, ASTNode *node);
@@ -517,49 +544,49 @@ static const char *intern_string(CG *cg, const char *s) {
     return label; /* pointer to the static buffer above - copied out by caller immediately */
 }
 
-/* ---- JOB call expression ------------------------------------------------ */
-/* Arguments are copied into the callee job's dedicated global parameter
-   slots (mirrors the interpreter's VMA-backed param binding), then the job
-   function runs and leaves its result in its global return slot. */
-static Opnd emit_call_expr(CG *cg, ASTNode *node) {
-    ASTNode *callee = node->as.call.callee;
-    CJob *job = NULL;
-
+/* Resolve a call target to its CJob (mirrors emit_call_expr's resolution
+   rules, including module-qualified calls and same-module sibling lookups).
+   Returns NULL and reports the compile error on failure. */
+static CJob *cg_resolve_job(CG *cg, ASTNode *callee, int line) {
     if (callee->type == NODE_MODULE_REF) {
-        /* Module-member call: math.ADD(...) */
         const char *mod_name = callee->as.module_ref.module;
         const char *member_name = callee->as.module_ref.member;
         CgModule *mod = cg_module_find(cg, mod_name);
-        if (!mod) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "unknown module '%s'", mod_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
+        if (!mod) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "unknown module '%s'", mod_name); cg_error(cg, line, errbuf); return NULL; }
         CgModMember *mm = cg_module_member_find(mod, member_name);
-        if (!mm) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' has no member '%s'", mod_name, member_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
-        if (!mm->is_exported) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' member '%s' is not exported", mod_name, member_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
-        if (mm->kind != CG_MOD_MEMBER_JOB) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' member '%s' is not a job", mod_name, member_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
-        if (!mm->job_internal) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' job '%s' not found (internal error)", mod_name, member_name); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
-        job = cg_job_lookup(cg, mm->job_internal);
-        if (!job) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "internal job '%s' not found", mm->job_internal); cg_error(cg, node->line, errbuf); Opnd bad = alloc_temp(cg); call1(cg, "vo_set_emp", bad.text); return bad; }
-    } else if (callee->type == NODE_IDENTIFIER) {
-        /* Direct call. If we're compiling a job that belongs to a module,
-           prefer a sibling job in that same module first (so unqualified
-           calls between jobs declared in the same PEICE resolve without
-           needing self-qualification), then fall back to a top-level job
-           of the same name. */
+        if (!mm) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' has no member '%s'", mod_name, member_name); cg_error(cg, line, errbuf); return NULL; }
+        if (!mm->is_exported) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' member '%s' is not exported", mod_name, member_name); cg_error(cg, line, errbuf); return NULL; }
+        if (mm->kind != CG_MOD_MEMBER_JOB) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' member '%s' is not a job", mod_name, member_name); cg_error(cg, line, errbuf); return NULL; }
+        if (!mm->job_internal) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "module '%s' job '%s' not found (internal error)", mod_name, member_name); cg_error(cg, line, errbuf); return NULL; }
+        CJob *j = cg_job_lookup(cg, mm->job_internal);
+        if (!j) { char errbuf[256]; snprintf(errbuf, sizeof(errbuf), "internal job '%s' not found", mm->job_internal); cg_error(cg, line, errbuf); return NULL; }
+        return j;
+    }
+    if (callee->type == NODE_IDENTIFIER) {
         const char *fname = callee->as.identifier.name;
-        job = NULL;
+        CJob *job = NULL;
         if (cg->cur_job_module) {
             char qualified[128];
             snprintf(qualified, sizeof(qualified), "%s#%s", cg->cur_job_module, fname);
             job = cg_job_lookup(cg, qualified);
         }
         if (!job) job = cg_job_lookup(cg, fname);
-        if (!job) {
-            cg_error(cg, node->line, "call to unknown job (analyzer should have caught this)");
-            Opnd bad = alloc_temp(cg);
-            call1(cg, "vo_set_emp", bad.text);
-            return bad;
-        }
-    } else {
-        cg_error(cg, node->line, "only direct function calls are supported");
+        if (!job) { cg_error(cg, line, "call to unknown job (analyzer should have caught this)"); return NULL; }
+        return job;
+    }
+    cg_error(cg, line, "only direct function calls are supported");
+    return NULL;
+}
+
+/* ---- JOB call expression ------------------------------------------------ */
+/* Arguments are copied into the callee job's dedicated global parameter
+   slots (mirrors the interpreter's VMA-backed param binding), then the job
+   function runs and leaves its result in its global return slot. */
+static Opnd emit_call_expr(CG *cg, ASTNode *node) {
+    ASTNode *callee = node->as.call.callee;
+    CJob *job = cg_resolve_job(cg, callee, node->line);
+
+    if (!job) {
         Opnd bad = alloc_temp(cg);
         call1(cg, "vo_set_emp", bad.text);
         return bad;
@@ -589,6 +616,275 @@ static Opnd emit_call_expr(CG *cg, ASTNode *node) {
     Opnd out = alloc_temp(cg);
     call1(cg, "vo_set_emp", out.text);
     call2(cg, "vo_assign", out.text, retrip);
+    return out;
+}
+
+static void call2_imm(CG *cg, const char *fn, const char *a0, long line) {
+    char linebuf[32]; snprintf(linebuf, sizeof(linebuf), "%ld", line);
+    const char *o[2]={a0,linebuf}; int im[2]={0,1}; callN(cg,fn,2,o,im);
+}
+
+/* ---- builtin commands (v1.4) ---- */
+/* A mutating command's FIRST operand is an lvalue (its collection/file/
+   task storage is written in place). Identifiers and bare VMAs resolve to
+   their persistent slot; INDEX targets and arbitrary expressions are
+   reported as native-compile limitations (the tree-walking interpreter
+   still accepts them). */
+static Opnd emit_lvalue_target(CG *cg, ASTNode *op, int line) {
+    if (op->type == NODE_IDENTIFIER) {
+        CSym *sym = scope_resolve(cg->scope, op->as.identifier.name);
+        if (!sym) { cg_error(cg, line, "internal: unresolved identifier (analyzer should have caught this)"); }
+        else return global_opnd(sym->is_loop_var ? sym->loop_label : global_label_for_addr(cg, sym->vma));
+    }
+    if (op->type == NODE_VMA_REF)
+        return global_opnd(global_label_for_addr(cg, op->as.vma_ref.name));
+    cg_error(cg, line, "indexed / non-variable command targets are not supported by the native compiler (voc) - use a named variable or VMA");
+    Opnd bad = alloc_temp(cg);
+    call1(cg, "vo_set_emp", bad.text);
+    return bad;
+}
+
+/* HOLD/CLAIM/HALT take a task lvalue when possible (so state like "run
+   once" persists in the owning variable); otherwise a plain expression. */
+static Opnd emit_task_operand(CG *cg, ASTNode *op, int line) {
+    if (op->type == NODE_IDENTIFIER) {
+        CSym *sym = scope_resolve(cg->scope, op->as.identifier.name);
+        if (sym) return global_opnd(sym->is_loop_var ? sym->loop_label : global_label_for_addr(cg, sym->vma));
+    }
+    if (op->type == NODE_VMA_REF)
+        return global_opnd(global_label_for_addr(cg, op->as.vma_ref.name));
+    if (op->type == NODE_INDEX) {
+        cg_error(cg, line, "indexed task operands are not supported by the native compiler (voc)");
+        Opnd bad = alloc_temp(cg);
+        call1(cg, "vo_set_emp", bad.text);
+        return bad;
+    }
+    return emit_expr(cg, op);
+}
+
+static Opnd emit_command(CG *cg, ASTNode *node) {
+    CommandKind kind = node->as.command.kind;
+    NodeList *a = &node->as.command.args;
+    int line = node->line;
+    int n = a->count;
+
+    Opnd out = alloc_temp(cg);
+    call1(cg, "vo_set_emp", out.text);
+
+    switch (kind) {
+    case CMD_ATTACH: {
+        Opnd coll = emit_lvalue_target(cg, a->items[0], line);
+        Opnd item = emit_expr(cg, a->items[1]);
+        call3_imm2(cg, "vo_cmd_attach", coll.text, item.text, line);
+        free_if_temp(cg, &item);
+        break;
+    }
+    case CMD_PLACE: {
+        Opnd coll = emit_lvalue_target(cg, a->items[0], line);
+        Opnd idx = emit_expr(cg, a->items[1]);
+        Opnd item = emit_expr(cg, a->items[2]);
+        call4_imm(cg, "vo_cmd_place", coll.text, idx.text, item.text, line);
+        free_if_temp(cg, &item);
+        free_if_temp(cg, &idx);
+        break;
+    }
+    case CMD_ERASE:
+        if (n == 2) {
+            Opnd coll = emit_lvalue_target(cg, a->items[0], line);
+            Opnd idx = emit_expr(cg, a->items[1]);
+            call3_imm2(cg, "vo_cmd_erase_coll", coll.text, idx.text, line);
+            free_if_temp(cg, &idx);
+        } else {
+            Opnd p = emit_expr(cg, a->items[0]);
+            call2_imm(cg, "vo_cmd_erase_file", p.text, line);
+            free_if_temp(cg, &p);
+        }
+        break;
+    case CMD_COUNT: {
+        Opnd v = emit_expr(cg, a->items[0]);
+        call3_imm2(cg, "vo_cmd_count", out.text, v.text, line);
+        free_if_temp(cg, &v);
+        break;
+    }
+    case CMD_TAKE: {
+        Opnd v = emit_expr(cg, a->items[0]);
+        call3_imm2(cg, "vo_cmd_take", out.text, v.text, line);
+        free_if_temp(cg, &v);
+        break;
+    }
+    case CMD_SEEK: {
+        Opnd hay = emit_expr(cg, a->items[0]);
+        Opnd ndl = emit_expr(cg, a->items[1]);
+        call4_imm(cg, "vo_cmd_seek", out.text, hay.text, ndl.text, line);
+        free_if_temp(cg, &ndl);
+        free_if_temp(cg, &hay);
+        break;
+    }
+    case CMD_HAS:
+        if (n == 1) {
+            Opnd p = emit_expr(cg, a->items[0]);
+            call3_imm2(cg, "vo_cmd_has_path", out.text, p.text, line);
+            free_if_temp(cg, &p);
+        } else {
+            Opnd hay = emit_expr(cg, a->items[0]);
+            Opnd ndl = emit_expr(cg, a->items[1]);
+            call4_imm(cg, "vo_cmd_has", out.text, hay.text, ndl.text, line);
+            free_if_temp(cg, &ndl);
+            free_if_temp(cg, &hay);
+        }
+        break;
+    case CMD_BIND: {
+        Opnd coll = emit_expr(cg, a->items[0]);
+        Opnd sep = emit_expr(cg, a->items[1]);
+        call4_imm(cg, "vo_cmd_bind", out.text, coll.text, sep.text, line);
+        free_if_temp(cg, &sep);
+        free_if_temp(cg, &coll);
+        break;
+    }
+    case CMD_SEVER: {
+        Opnd tex = emit_expr(cg, a->items[0]);
+        Opnd sep = emit_expr(cg, a->items[1]);
+        call4_imm(cg, "vo_cmd_sever", out.text, tex.text, sep.text, line);
+        free_if_temp(cg, &sep);
+        free_if_temp(cg, &tex);
+        break;
+    }
+    case CMD_CUT: {
+        Opnd v = emit_expr(cg, a->items[0]);
+        call3_imm2(cg, "vo_cmd_cut", out.text, v.text, line);
+        free_if_temp(cg, &v);
+        break;
+    }
+    case CMD_RAISE:
+    case CMD_LOWER: {
+        Opnd v = emit_expr(cg, a->items[0]);
+        call4_imm(cg, "vo_cmd_case", out.text, v.text, kind == CMD_RAISE ? "1" : "0", line);
+        free_if_temp(cg, &v);
+        break;
+    }
+    case CMD_UNSEAL: {
+        Opnd path = emit_expr(cg, a->items[0]);
+        Opnd mode;
+        if (n == 2) mode = emit_expr(cg, a->items[1]);
+        else { mode = alloc_temp(cg); call1(cg, "vo_set_emp", mode.text); }
+        char linebuf[32]; snprintf(linebuf, sizeof(linebuf), "%d", line);
+        const char *o[5] = { out.text, path.text, mode.text, n == 2 ? "1" : "0", linebuf };
+        int im[5] = { 0, 0, 0, 1, 1 };
+        callN(cg, "vo_cmd_unseal", 5, o, im);
+        free_if_temp(cg, &mode);
+        free_if_temp(cg, &path);
+        break;
+    }
+    case CMD_SEAL: {
+        Opnd f = emit_expr(cg, a->items[0]);
+        call2_imm(cg, "vo_cmd_seal", f.text, line);
+        free_if_temp(cg, &f);
+        break;
+    }
+    case CMD_DRAW: {
+        Opnd f = emit_expr(cg, a->items[0]);
+        Opnd cnt;
+        if (n == 2) cnt = emit_expr(cg, a->items[1]);
+        else { cnt = alloc_temp(cg); call1(cg, "vo_set_emp", cnt.text); }
+        char linebuf[32]; snprintf(linebuf, sizeof(linebuf), "%d", line);
+        const char *o[5] = { out.text, f.text, cnt.text, n == 2 ? "1" : "0", linebuf };
+        int im[5] = { 0, 0, 0, 1, 1 };
+        callN(cg, "vo_cmd_draw", 5, o, im);
+        free_if_temp(cg, &cnt);
+        free_if_temp(cg, &f);
+        break;
+    }
+    case CMD_PUT: {
+        Opnd f = emit_expr(cg, a->items[0]);
+        Opnd t = emit_expr(cg, a->items[1]);
+        call3_imm2(cg, "vo_cmd_put", f.text, t.text, line);
+        free_if_temp(cg, &t);
+        free_if_temp(cg, &f);
+        break;
+    }
+    case CMD_MOVE: {
+        Opnd f = emit_expr(cg, a->items[0]);
+        Opnd pos = emit_expr(cg, a->items[1]);
+        call3_imm2(cg, "vo_cmd_move", f.text, pos.text, line);
+        free_if_temp(cg, &pos);
+        free_if_temp(cg, &f);
+        break;
+    }
+    case CMD_MAKE: {
+        Opnd p1 = emit_expr(cg, a->items[0]);
+        call2_imm(cg, "vo_cmd_make", p1.text, line);
+        free_if_temp(cg, &p1);
+        break;
+    }
+    case CMD_RECALL:
+    case CMD_CLONE:
+    case CMD_DELIVER: {
+        const char *fn = kind == CMD_RECALL ? "vo_cmd_recall"
+                        : kind == CMD_CLONE ? "vo_cmd_clone" : "vo_cmd_deliver";
+        Opnd p1 = emit_expr(cg, a->items[0]);
+        Opnd p2 = emit_expr(cg, a->items[1]);
+        call3_imm2(cg, fn, p1.text, p2.text, line);
+        free_if_temp(cg, &p2);
+        free_if_temp(cg, &p1);
+        break;
+    }
+    case CMD_SPAWN: {
+        ASTNode *call = a->items[0];
+        if (call->type != NODE_CALL) { cg_error(cg, line, "SPAWN expects a job call"); break; }
+        CJob *job = cg_resolve_job(cg, call->as.call.callee, line);
+        if (!job) break;
+        if (call->as.call.args.count != job->param_count) { cg_error(cg, line, "SPAWN: wrong number of arguments"); break; }
+        char jidx[16], argc[16];
+        snprintf(jidx, sizeof(jidx), "%d", job->tab_index);
+        snprintf(argc, sizeof(argc), "%d", job->param_count);
+        char linebuf[32]; snprintf(linebuf, sizeof(linebuf), "%d", line);
+        const char *o[4] = { out.text, jidx, argc, linebuf };
+        int im[4] = { 0, 1, 1, 1 };
+        callN(cg, "vo_cmd_spawn", 4, o, im);
+        for (int i = 0; i < job->param_count; i++) {
+            Opnd arg = emit_expr(cg, call->as.call.args.items[i]);
+            char ibuf[8]; snprintf(ibuf, sizeof(ibuf), "%d", i);
+            const char *so[4] = { out.text, ibuf, arg.text, linebuf };
+            int sim[4] = { 0, 1, 0, 1 };
+            callN(cg, "vo_task_set_arg", 4, so, sim);
+            free_if_temp(cg, &arg);
+        }
+        break;
+    }
+    case CMD_HOLD: {
+        Opnd op = emit_task_operand(cg, a->items[0], line);
+        call2_imm(cg, "vo_cmd_hold", op.text, line);
+        free_if_temp(cg, &op);
+        break;
+    }
+    case CMD_CLAIM: {
+        Opnd op = emit_task_operand(cg, a->items[0], line);
+        call3_imm2(cg, "vo_cmd_claim", out.text, op.text, line);
+        free_if_temp(cg, &op);
+        break;
+    }
+    case CMD_HALT: {
+        Opnd op = emit_task_operand(cg, a->items[0], line);
+        call2_imm(cg, "vo_cmd_halt", op.text, line);
+        free_if_temp(cg, &op);
+        break;
+    }
+    case CMD_SEIZE:
+    case CMD_RELEASE:
+    case CMD_ALIGN: {
+        Opnd lk = emit_expr(cg, a->items[0]);
+        const char *fn = kind == CMD_SEIZE ? "vo_cmd_seize"
+                      : kind == CMD_RELEASE ? "vo_cmd_release" : "vo_cmd_align";
+        call2_imm(cg, fn, lk.text, line);
+        free_if_temp(cg, &lk);
+        break;
+    }
+    default:
+        cg_error(cg, line, "event commands (ARM/DISARM/FIRE/RANK/KILL/SCREEN/LINK) are not supported by the "
+                          "native compiler (voc) - the tree-walking interpreter handles them");
+        break;
+    }
+
     return out;
 }
 
@@ -743,6 +1039,47 @@ static Opnd emit_expr(CG *cg, ASTNode *node) {
             free_if_temp(cg, &arr);
             return out;
         }
+        case NODE_SLICE: {
+            Opnd arr = emit_expr(cg, node->as.slice_expr.array);
+            Opnd start = emit_expr(cg, node->as.slice_expr.start);
+            Opnd end = emit_expr(cg, node->as.slice_expr.end);
+            out = alloc_temp(cg);
+            call5_imm(cg, "vo_slice", out.text, arr.text, start.text, end.text, node->line);
+            free_if_temp(cg, &end);
+            free_if_temp(cg, &start);
+            free_if_temp(cg, &arr);
+            return out;
+        }
+        case NODE_INTERP_LITERAL: {
+            out = alloc_temp(cg);
+            const char *lbl = intern_string(cg, node->as.interp_lit.text ? node->as.interp_lit.text : "");
+            char rip[48]; snprintf(rip, sizeof(rip), "%s(%%rip)", lbl);
+            call2(cg, "vo_set_tex", out.text, rip);
+            return out;
+        }
+        case NODE_TEX_INTERP: {
+            out = alloc_temp(cg);
+            {
+                const char *lbl = intern_string(cg, "");
+                char rip[48]; snprintf(rip, sizeof(rip), "%s(%%rip)", lbl);
+                call2(cg, "vo_set_tex", out.text, rip);
+            }
+            for (int i = 0; i < node->as.tex_interp.parts.count; i++) {
+                ASTNode *part = node->as.tex_interp.parts.items[i];
+                if (part->type == NODE_INTERP_LITERAL) {
+                    const char *lbl = intern_string(cg, part->as.interp_lit.text ? part->as.interp_lit.text : "");
+                    char rip[48]; snprintf(rip, sizeof(rip), "%s(%%rip)", lbl);
+                    call2(cg, "vo_tex_interp_append_cstr", out.text, rip);
+                } else {
+                    Opnd v = emit_expr(cg, part);
+                    call2(cg, "vo_tex_interp_append_val", out.text, v.text);
+                    free_if_temp(cg, &v);
+                }
+            }
+            return out;
+        }
+        case NODE_COMMAND:
+            return emit_command(cg, node);
         case NODE_ASSIGN: {
             Opnd rhs = emit_expr(cg, node->as.assign.value);
             ASTNode *target = node->as.assign.target;
@@ -854,8 +1191,16 @@ static void emit_stmt(CG *cg, ASTNode *node) {
             break;
         }
         case NODE_SHOW_STMT: {
-            Opnd v = emit_expr(cg, node->as.show_stmt.expr);
-            call1(cg, "vo_show", v.text);
+            int count = node->as.show_stmt.expr.count;
+            for (int i = 0; i < count; i++) {
+                Opnd v = emit_expr(cg, node->as.show_stmt.expr.items[i]);
+                call1(cg, i == count - 1 ? "vo_show" : "vo_show_part", v.text);
+                free_if_temp(cg, &v);
+            }
+            break;
+        }
+        case NODE_COMMAND: {
+            Opnd v = emit_command(cg, node);
             free_if_temp(cg, &v);
             break;
         }
@@ -1260,7 +1605,7 @@ int codegen_compile(ASTNode *program, CgTarget target, const char *source_dir, F
 
     /* ---- write vo_main ---- */
     {
-        long frame_bytes = (long)(cg.max_depth + 1) * SLOT_SIZE + cg.abi.shadow_space;
+        long frame_bytes = (long)(cg.max_depth + 1) * SLOT_SIZE + cg.abi.shadow_space + 8L * cg.max_stack_args;
         frame_bytes = (frame_bytes + 15) & ~15L;
         fprintf(out, "    .globl vo_main\nvo_main:\n    pushq %%rbp\n    movq %%rsp, %%rbp\n    subq $%ld, %%rsp\n", frame_bytes);
         fprintf(out, "%s", cg.body_buf);
@@ -1298,7 +1643,7 @@ int codegen_compile(ASTNode *program, CgTarget target, const char *source_dir, F
 
         if (cg.had_error) break;
 
-        long jframe = (long)(cg.max_depth + 1) * SLOT_SIZE + cg.abi.shadow_space;
+        long jframe = (long)(cg.max_depth + 1) * SLOT_SIZE + cg.abi.shadow_space + 8L * cg.max_stack_args;
         jframe = (jframe + 15) & ~15L;
         fprintf(out, "    .globl vo_job_%d\nvo_job_%d:\n    pushq %%rbp\n    movq %%rsp, %%rbp\n    subq $%ld, %%rsp\n", job->id, job->id, jframe);
         fprintf(out, "%s", cg.body_buf);
@@ -1316,6 +1661,10 @@ int codegen_compile(ASTNode *program, CgTarget target, const char *source_dir, F
     fprintf(out, "%s", cg.rodata_buf);
     fprintf(out, "\n");
 
+    /* job name string constants (referenced by the runtime job table) */
+    for (int i = 0; i < cg.job_count; i++)
+        fprintf(out, "vjobname_%d:\n    .string \"%s\"\n", cg.jobs[i].id, cg.jobs[i].name);
+
     fprintf(out, "    .bss\n");
     for (int i = 0; i < cg.gcount; i++)
         fprintf(out, "    .align 8\n%s:\n    .zero %ld\n", cg.globals[i].label, SLOT_SIZE);
@@ -1323,6 +1672,35 @@ int codegen_compile(ASTNode *program, CgTarget target, const char *source_dir, F
         fprintf(out, "    .align 8\nfor_iter_%d:\n    .zero %ld\n", i, SLOT_SIZE);
         fprintf(out, "    .align 8\nfor_end_%d:\n    .zero %ld\n", i, SLOT_SIZE);
     }
+
+    /* module vars: storage went to .bss alongside the module member's slot
+       guard; job param/ret slots are also emitted into .bss above. */
+
+    /* ---- runtime job table (vo_job_tab / vo_job_tab_count) ----
+       Emit unconditionally: the overlaid runtime object always contains a
+       relocation against vo_job_tab (from the generic vo_task_run /
+       vo_cmd_spawn helpers), and the static linker needs the symbol even
+       for programs that declare no jobs. Empty table is fine - job_index is
+       only ever read after a SPAWN, which requires at least one job. */
+    fprintf(out, "    .section .data\n");
+    fprintf(out, "    .globl vo_job_tab\n");
+    fprintf(out, "    .align 8\n");
+    fprintf(out, "vo_job_tab:\n");
+    for (int j = 0; j < cg.job_count; j++) {
+        CJob *job = &cg.jobs[j];
+        fprintf(out, "    .quad vjobname_%d\n", job->id);
+        fprintf(out, "    .quad %d\n", job->param_count);
+        fprintf(out, "    .quad vo_job_%d\n", job->id);
+        for (int p = 0; p < 16; p++) {
+            if (p < job->param_count) fprintf(out, "    .quad %s\n", job->param_labels[p]);
+            else fprintf(out, "    .quad 0\n");
+        }
+        fprintf(out, "    .quad %s\n", job->ret_label);
+    }
+    fprintf(out, "    .globl vo_job_tab_count\n");
+    fprintf(out, "    .align 4\n");
+    fprintf(out, "vo_job_tab_count:\n");
+    fprintf(out, "    .long %d\n", cg.job_count);
 
     free(cg.rodata_buf);
     free(cg.jobs);

@@ -15,7 +15,12 @@ static char *token_text(Token t) {
 
 static void error_at(Parser *p, Token t, const char *msg) {
     fprintf(stderr, "[line %d] Parse error at '%.*s': %s\n",
-            t.line, t.length, t.start, msg);
+            t.line, t.length, t.start ? t.start : "", msg);
+    p->had_error = 1;
+}
+
+static void error_msg(Parser *p, int line, const char *msg) {
+    fprintf(stderr, "[line %d] Parse error: %s\n", line, msg);
     p->had_error = 1;
 }
 
@@ -72,13 +77,18 @@ static ASTNode *parse_expression(Parser *p);
 static ASTNode *parse_block_until(Parser *p, const VOTokenType *terminators, int n_terminators);
 static ASTNode *parse_statement(Parser *p);
 static ASTNode *parse_conditional(Parser *p, int negate_condition);
+static ASTNode *parse_command_call(Parser *p, CommandKind kind);
+static ASTNode *parse_command_stmt(Parser *p, CommandKind kind);
+static ASTNode *parse_command_operand(Parser *p, CommandKind kind);
 
 /* ---------------------------------------------------------------------
  * Type keyword check (for VAR/HARD/JOB params)
  * ------------------------------------------------------------------- */
 static int is_type_keyword(VOTokenType t) {
     return t == TOKEN_TYPE_NUM || t == TOKEN_TYPE_DEC || t == TOKEN_TYPE_TEX ||
-           t == TOKEN_TYPE_YN  || t == TOKEN_TYPE_COLL || t == TOKEN_TYPE_EMP;
+           t == TOKEN_TYPE_YN  || t == TOKEN_TYPE_COLL || t == TOKEN_TYPE_EMP ||
+           t == TOKEN_TYPE_FILE || t == TOKEN_TYPE_TASK ||
+           t == TOKEN_TYPE_LOCK || t == TOKEN_TYPE_EVENT;
 }
 
 /* ---------------------------------------------------------------------
@@ -90,6 +100,174 @@ static ASTNode *make_binary(VOTokenType op, ASTNode *left, ASTNode *right, int l
     n->as.binary.op = op;
     n->as.binary.left = left;
     n->as.binary.right = right;
+    return n;
+}
+
+/* Build a NODE_TEX_INTERP expression from the inner content of a TEX literal.
+   The `{expr}` regions are parsed as real expressions by spinning up a
+   fresh Parser on each sub-expression's source slice. `{{` and `}}` are
+   literal braces. A stray, unpaired `}` is a parse error. */
+static ASTNode *tex_interp_from_inner(Parser *p, const char *inner, int line) {
+    ASTNode *n = ast_new(NODE_TEX_INTERP, line);
+    nodelist_init(&n->as.tex_interp.parts);
+
+    int len = (int)strlen(inner);
+    char *lit = malloc(len * 2 + 2);
+    int lit_len = 0;
+
+#define EMIT_LIT()                                                        \
+    do {                                                                  \
+        if (lit_len > 0) {                                                \
+            ASTNode *ln = ast_new(NODE_INTERP_LITERAL, line);             \
+            ln->as.interp_lit.text = malloc(lit_len + 1);                 \
+            memcpy(ln->as.interp_lit.text, lit, lit_len);                 \
+            ln->as.interp_lit.text[lit_len] = '\0';                       \
+            nodelist_push(&n->as.tex_interp.parts, ln);                   \
+            lit_len = 0;                                                  \
+        }                                                                 \
+    } while (0)
+
+    int i = 0;
+    while (i < len) {
+        char c = inner[i];
+        if (c == '{') {
+            if (i + 1 < len && inner[i + 1] == '{') {
+                lit[lit_len++] = '{';
+                i += 2;
+                continue;
+            }
+            /* find closing '}' */
+            int j = i + 1;
+            while (j < len && inner[j] != '}') {
+                if (inner[j] == '{') {
+                    /* nested/unclosed brace inside interpolation is malformed */
+                    error_msg(p, line, "malformed interpolation: missing '}'");
+                    free(n->as.tex_interp.parts.items);
+                    nodelist_init(&n->as.tex_interp.parts);
+                    free(lit);
+                    ast_free(n);
+                    return ast_new(NODE_EMP_LITERAL, line);
+                }
+                j++;
+            }
+            if (j >= len) {
+                error_msg(p, line, "malformed interpolation: missing '}'");
+                free(n->as.tex_interp.parts.items);
+                nodelist_init(&n->as.tex_interp.parts);
+                free(lit);
+                ast_free(n);
+                return ast_new(NODE_EMP_LITERAL, line);
+            }
+            /* literal text so far becomes an INTERP_LITERAL part */
+            EMIT_LIT();
+            /* sub-expression is inner[i+1 .. j-1] */
+            int sub_len = j - (i + 1);
+            char *sub = malloc(sub_len + 1);
+            if (sub_len > 0) {
+                memcpy(sub, inner + i + 1, sub_len);
+                sub[sub_len] = '\0';
+                Parser sp;
+                parser_init(&sp, sub);
+                ASTNode *expr = parse_expression(&sp);
+                int ok = !sp.had_error && check(&sp, TOKEN_EOF);
+                free(sub);
+                if (!ok) {
+                    error_msg(p, line, "malformed interpolation expression");
+                    if (expr) ast_free(expr);
+                    free(n->as.tex_interp.parts.items);
+                    nodelist_init(&n->as.tex_interp.parts);
+                    free(lit);
+                    ast_free(n);
+                    return ast_new(NODE_EMP_LITERAL, line);
+                }
+                nodelist_push(&n->as.tex_interp.parts, expr);
+            } else {
+                free(sub);
+                error_msg(p, line, "empty interpolation expression");
+                free(n->as.tex_interp.parts.items);
+                nodelist_init(&n->as.tex_interp.parts);
+                free(lit);
+                ast_free(n);
+                return ast_new(NODE_EMP_LITERAL, line);
+            }
+            i = j + 1;
+        } else if (c == '}') {
+            if (i + 1 < len && inner[i + 1] == '}') {
+                lit[lit_len++] = '}';
+                i += 2;
+                continue;
+            }
+            error_msg(p, line, "malformed interpolation: unexpected '}'");
+            free(n->as.tex_interp.parts.items);
+            nodelist_init(&n->as.tex_interp.parts);
+            free(lit);
+            ast_free(n);
+            return ast_new(NODE_EMP_LITERAL, line);
+            i++;
+        } else {
+            lit[lit_len++] = c;
+            i++;
+        }
+    }
+
+    EMIT_LIT();
+#undef EMIT_LIT
+    free(lit);
+    return n;
+}
+
+static ASTNode *parse_tex_literal(Parser *p) {
+    Token t = p->current;
+    advance(p);
+
+    char *raw = token_text(t);
+    int len = (int)strlen(raw);
+    char *inner = malloc(len - 1);
+    memcpy(inner, raw + 1, len - 2);
+    inner[len - 2] = '\0';
+    free(raw);
+
+    if (!strchr(inner, '{') && !strchr(inner, '}')) {
+        ASTNode *n = ast_new(NODE_TEX_LITERAL, t.line);
+        n->as.tex_lit.value = inner;
+        return n;
+    }
+
+    ASTNode *n = tex_interp_from_inner(p, inner, t.line);
+    free(inner);
+    return n;
+}
+
+/* Expression-form builtin command: NAME(args...) */
+static ASTNode *parse_command_call(Parser *p, CommandKind kind) {
+    int line = p->current.line;
+    advance(p); /* command keyword */
+    expect(p, TOKEN_LPAREN, "expected '(' after command");
+    ASTNode *n = ast_new(NODE_COMMAND, line);
+    n->as.command.kind = kind;
+    nodelist_init(&n->as.command.args);
+    if (!check(p, TOKEN_RPAREN)) {
+        do {
+            nodelist_push(&n->as.command.args, parse_expression(p));
+        } while (match(p, TOKEN_COMMA));
+    }
+    expect(p, TOKEN_RPAREN, "expected ')' after command arguments");
+    return n;
+}
+
+/* Operand-form command used in expression positions (SPAWN work(), CLAIM W):
+   the operand is one or more unbracketed expressions, e.g. SPAWN JOB call. */
+static ASTNode *parse_command_operand(Parser *p, CommandKind kind) {
+    int line = p->current.line;
+    advance(p); /* command keyword */
+    ASTNode *n = ast_new(NODE_COMMAND, line);
+    n->as.command.kind = kind;
+    nodelist_init(&n->as.command.args);
+    if (!check(p, TOKEN_NEWLINE) && !check(p, TOKEN_EOF) && !check(p, TOKEN_COMMA)) {
+        do {
+            nodelist_push(&n->as.command.args, parse_expression(p));
+        } while (match(p, TOKEN_COMMA));
+    }
     return n;
 }
 
@@ -128,16 +306,7 @@ static ASTNode *parse_primary(Parser *p) {
             return n;
         }
         case TOKEN_TEX_LITERAL: {
-            advance(p);
-            ASTNode *n = ast_new(NODE_TEX_LITERAL, t.line);
-            char *raw = token_text(t);
-            int len = (int)strlen(raw);
-            char *inner = malloc(len - 1);
-            memcpy(inner, raw + 1, len - 2);
-            inner[len - 2] = '\0';
-            n->as.tex_lit.value = inner;
-            free(raw);
-            return n;
+            return parse_tex_literal(p);
         }
         case TOKEN_YES: {
             advance(p);
@@ -208,6 +377,21 @@ static ASTNode *parse_primary(Parser *p) {
         case TOKEN_LBRACKET:
             return parse_array_literal(p);
 
+        /* Expression-form commands (parenthesized): COLL/TEX, files  */
+        case TOKEN_COUNT:    return parse_command_call(p, CMD_COUNT);
+        case TOKEN_TAKE:     return parse_command_call(p, CMD_TAKE);
+        case TOKEN_SEEK:     return parse_command_call(p, CMD_SEEK);
+        case TOKEN_HAS:      return parse_command_call(p, CMD_HAS);
+        case TOKEN_BIND:     return parse_command_call(p, CMD_BIND);
+        case TOKEN_SEVER:    return parse_command_call(p, CMD_SEVER);
+        case TOKEN_CUT:      return parse_command_call(p, CMD_CUT);
+        case TOKEN_RAISE:    return parse_command_call(p, CMD_RAISE);
+        case TOKEN_LOWER:    return parse_command_call(p, CMD_LOWER);
+        case TOKEN_DRAW:     return parse_command_call(p, CMD_DRAW);
+        case TOKEN_UNSEAL:   return parse_command_call(p, CMD_UNSEAL);
+        case TOKEN_SPAWN:    return parse_command_operand(p, CMD_SPAWN);
+        case TOKEN_CLAIM:    return parse_command_operand(p, CMD_CLAIM);
+
         default:
             error_at(p, t, "expected an expression");
             advance(p);
@@ -222,12 +406,32 @@ static ASTNode *parse_postfix(Parser *p) {
         if (check(p, TOKEN_LBRACKET)) {
             int line = p->current.line;
             advance(p);
-            ASTNode *index = parse_expression(p);
-            expect(p, TOKEN_RBRACKET, "expected ']' after index expression");
-            ASTNode *n = ast_new(NODE_INDEX, line);
-            n->as.index_expr.array = node;
-            n->as.index_expr.index = index;
-            node = n;
+            ASTNode *start = NULL;
+            ASTNode *end = NULL;
+            if (!check(p, TOKEN_COLON)) {
+                start = parse_expression(p);
+            }
+            if (match(p, TOKEN_COLON)) {
+                /* slice form: [start:end] with either bound optional */
+                if (!check(p, TOKEN_RBRACKET))
+                    end = parse_expression(p);
+                expect(p, TOKEN_RBRACKET, "expected ']' after slice expression");
+                ASTNode *n = ast_new(NODE_SLICE, line);
+                n->as.slice_expr.array = node;
+                n->as.slice_expr.start = start;
+                n->as.slice_expr.end = end;
+                node = n;
+            } else {
+                /* plain index form */
+                if (!start) {
+                    error_at(p, p->current, "expected index expression after '['");
+                }
+                expect(p, TOKEN_RBRACKET, "expected ']' after index expression");
+                ASTNode *n = ast_new(NODE_INDEX, line);
+                n->as.index_expr.array = node;
+                n->as.index_expr.index = start;
+                node = n;
+            }
         } else if (check(p, TOKEN_LPAREN)) {
             /* Function call */
             int line = p->current.line;
@@ -480,7 +684,7 @@ static ASTNode *parse_var_decl(Parser *p) {
     advance(p); /* VAR */
 
     if (!is_type_keyword(p->current.type)) {
-        error_at(p, p->current, "expected a type (NUM/DEC/TEX/YN/COLL/EMP)");
+        error_at(p, p->current, "expected a type (NUM/DEC/TEX/YN/COLL/EMP/FILE/TASK/LOCK/EVENT)");
     }
     VOTokenType var_type = p->current.type;
     advance(p);
@@ -505,7 +709,7 @@ static ASTNode *parse_hard_decl(Parser *p) {
     advance(p); /* HARD */
 
     if (!is_type_keyword(p->current.type)) {
-        error_at(p, p->current, "expected a type (NUM/DEC/TEX/YN/COLL/EMP)");
+        error_at(p, p->current, "expected a type (NUM/DEC/TEX/YN/COLL/EMP/FILE/TASK/LOCK/EVENT)");
     }
     VOTokenType var_type = p->current.type;
     advance(p);
@@ -581,9 +785,11 @@ static ASTNode *parse_assignment_or_incdec_statement(Parser *p) {
 static ASTNode *parse_show_stmt(Parser *p) {
     int line = p->current.line;
     advance(p);
-    ASTNode *expr = parse_expression(p);
     ASTNode *n = ast_new(NODE_SHOW_STMT, line);
-    n->as.show_stmt.expr = expr;
+    nodelist_init(&n->as.show_stmt.expr);
+    do {
+        nodelist_push(&n->as.show_stmt.expr, parse_expression(p));
+    } while (match(p, TOKEN_COMMA));
     expect_statement_end(p);
     return n;
 }
@@ -593,7 +799,10 @@ static ASTNode *parse_store_stmt(Parser *p) {
     advance(p);
     ASTNode *value = parse_expression(p);
     Token vma_tok = p->current;
-    expect(p, TOKEN_VMA, "expected a VMA as the STORE target");
+    if (!check(p, TOKEN_VMA) && !check(p, TOKEN_IDENTIFIER)) {
+        error_at(p, p->current, "expected a VMA or declared name as the STORE target");
+    }
+    advance(p);
     ASTNode *n = ast_new(NODE_STORE_STMT, line);
     n->as.store_stmt.value = value;
     n->as.store_stmt.target_vma = token_text(vma_tok);
@@ -611,6 +820,22 @@ static ASTNode *parse_clean_stmt(Parser *p) {
     advance(p);
     ASTNode *n = ast_new(NODE_CLEAN_STMT, line);
     n->as.clean_stmt.target = token_text(target_tok);
+    expect_statement_end(p);
+    return n;
+}
+
+/* Statement-form builtin command: NAME operand[, operand...]  (no parens) */
+static ASTNode *parse_command_stmt(Parser *p, CommandKind kind) {
+    int line = p->current.line;
+    advance(p); /* command keyword */
+    ASTNode *n = ast_new(NODE_COMMAND, line);
+    n->as.command.kind = kind;
+    nodelist_init(&n->as.command.args);
+    if (!check(p, TOKEN_NEWLINE) && !check(p, TOKEN_EOF)) {
+        do {
+            nodelist_push(&n->as.command.args, parse_expression(p));
+        } while (match(p, TOKEN_COMMA));
+    }
     expect_statement_end(p);
     return n;
 }
@@ -919,12 +1144,12 @@ static ASTNode *parse_when_stmt(Parser *p) {
         advance(p);
         expect(p, TOKEN_START, "expected START after WHEN PROGRAM");
         n->as.when_stmt.kind = WHEN_PROGRAM_START;
-    } else if (check(p, TOKEN_VMA) && p->next.type == TOKEN_CHANGED) {
-        Token vma_tok = p->current;
+    } else if ((check(p, TOKEN_VMA) || check(p, TOKEN_IDENTIFIER)) && p->next.type == TOKEN_CHANGED) {
+        Token target_tok = p->current;
         advance(p);
         advance(p);
         n->as.when_stmt.kind = WHEN_VMA_CHANGED;
-        n->as.when_stmt.vma_name = token_text(vma_tok);
+        n->as.when_stmt.vma_name = token_text(target_tok);
     } else {
         n->as.when_stmt.kind = WHEN_CONDITION;
         n->as.when_stmt.condition = parse_expression(p);
@@ -960,6 +1185,31 @@ static ASTNode *parse_statement(Parser *p) {
         case TOKEN_BRING:     return parse_bring_stmt(p);
         case TOKEN_SHIP:      return parse_ship_stmt(p);
         case TOKEN_PEICE:     return parse_peice_decl(p);
+
+        /* v1.4 statement-form commands */
+        case TOKEN_ATTACH:    return parse_command_stmt(p, CMD_ATTACH);
+        case TOKEN_PLACE:     return parse_command_stmt(p, CMD_PLACE);
+        case TOKEN_ERASE:     return parse_command_stmt(p, CMD_ERASE);
+        case TOKEN_SEAL:      return parse_command_stmt(p, CMD_SEAL);
+        case TOKEN_PUT:       return parse_command_stmt(p, CMD_PUT);
+        case TOKEN_MOVE:      return parse_command_stmt(p, CMD_MOVE);
+        case TOKEN_MAKE:      return parse_command_stmt(p, CMD_MAKE);
+        case TOKEN_RECALL:    return parse_command_stmt(p, CMD_RECALL);
+        case TOKEN_CLONE:     return parse_command_stmt(p, CMD_CLONE);
+        case TOKEN_DELIVER:   return parse_command_stmt(p, CMD_DELIVER);
+        case TOKEN_HOLD:      return parse_command_stmt(p, CMD_HOLD);
+        case TOKEN_HALT:      return parse_command_stmt(p, CMD_HALT);
+        case TOKEN_SEIZE:     return parse_command_stmt(p, CMD_SEIZE);
+        case TOKEN_RELEASE:   return parse_command_stmt(p, CMD_RELEASE);
+        case TOKEN_ALIGN:     return parse_command_stmt(p, CMD_ALIGN);
+        case TOKEN_ARM:       return parse_command_stmt(p, CMD_ARM);
+        case TOKEN_DISARM:    return parse_command_stmt(p, CMD_DISARM);
+        case TOKEN_FIRE:      return parse_command_stmt(p, CMD_FIRE);
+        case TOKEN_RANK:      return parse_command_stmt(p, CMD_RANK);
+        case TOKEN_KILL:      return parse_command_stmt(p, CMD_KILL);
+        case TOKEN_SCREEN:    return parse_command_stmt(p, CMD_SCREEN);
+        case TOKEN_LINK:      return parse_command_stmt(p, CMD_LINK);
+        case TOKEN_DRAW:      return parse_command_stmt(p, CMD_DRAW);
 
         case TOKEN_IFNOT:
             if (p->next.type == TOKEN_NEWLINE) {

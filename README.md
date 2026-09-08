@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo-wordmark.svg" alt="Virtual Order" width="600">
+  <img src="assets/logo-wordmark.svg" alt="Virtual Order" width="600">
 </p>
 
 <p align="center">
@@ -67,7 +67,7 @@ source.vo  ->  lexer  ->  parser  ->  analyzer  ->  runtime
 - **Assembly-style GOTO** — `Label:` / `GOTO Label`, whole-program flat namespace,
   forward references allowed.
 
-See [`VirtualOrder-v1.3-Language-Specification.md`](VirtualOrder-v1.3-Language-Specification.md) for the full language
+See [`Virtual_Order_v1_4_Language_Specification.md`](Virtual_Order_v1_4_Language_Specification.md) for the full language
 specification.
 
 ## Building

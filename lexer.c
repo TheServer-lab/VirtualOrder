@@ -17,6 +17,7 @@ static const Keyword KEYWORDS[] = {
     {"STORE",      TOKEN_STORE},
     {"LOAD",       TOKEN_LOAD},
     {"SHOW",       TOKEN_SHOW},
+    {"TAKE",       TOKEN_TAKE},
     {"CLEANALL",   TOKEN_CLEANALL},
     {"CLEAN",      TOKEN_CLEAN},
     {"AUTOCLEAN",  TOKEN_AUTOCLEAN},
@@ -53,6 +54,10 @@ static const Keyword KEYWORDS[] = {
     {"YN",         TOKEN_TYPE_YN},
     {"COLL",       TOKEN_TYPE_COLL},
     {"EMP",        TOKEN_TYPE_EMP},
+    {"FILE",       TOKEN_TYPE_FILE},
+    {"TASK",       TOKEN_TYPE_TASK},
+    {"LOCK",       TOKEN_TYPE_LOCK},
+    {"EVENT",      TOKEN_TYPE_EVENT},
 
     {"YES",        TOKEN_YES},
     {"NO",         TOKEN_NO},
@@ -74,6 +79,44 @@ static const Keyword KEYWORDS[] = {
     {"ENDDO",      TOKEN_ENDDO},
     {"SERVE",      TOKEN_SERVE},
     {"ISSUE",      TOKEN_ISSUE},
+
+    {"ATTACH",     TOKEN_ATTACH},
+    {"PLACE",      TOKEN_PLACE},
+    {"ERASE",      TOKEN_ERASE},
+    {"COUNT",      TOKEN_COUNT},
+    {"SEEK",       TOKEN_SEEK},
+    {"HAS",        TOKEN_HAS},
+    {"BIND",       TOKEN_BIND},
+    {"SEVER",      TOKEN_SEVER},
+    {"CUT",        TOKEN_CUT},
+    {"RAISE",      TOKEN_RAISE},
+    {"LOWER",      TOKEN_LOWER},
+
+    {"UNSEAL",     TOKEN_UNSEAL},
+    {"SEAL",       TOKEN_SEAL},
+    {"DRAW",       TOKEN_DRAW},
+    {"PUT",        TOKEN_PUT},
+    {"MOVE",       TOKEN_MOVE},
+    {"MAKE",       TOKEN_MAKE},
+    {"RECALL",     TOKEN_RECALL},
+    {"CLONE",      TOKEN_CLONE},
+    {"DELIVER",    TOKEN_DELIVER},
+
+    {"SPAWN",      TOKEN_SPAWN},
+    {"HOLD",       TOKEN_HOLD},
+    {"CLAIM",      TOKEN_CLAIM},
+    {"HALT",       TOKEN_HALT},
+    {"SEIZE",      TOKEN_SEIZE},
+    {"RELEASE",    TOKEN_RELEASE},
+    {"ALIGN",      TOKEN_ALIGN},
+
+    {"ARM",        TOKEN_ARM},
+    {"DISARM",     TOKEN_DISARM},
+    {"FIRE",       TOKEN_FIRE},
+    {"RANK",       TOKEN_RANK},
+    {"KILL",       TOKEN_KILL},
+    {"SCREEN",     TOKEN_SCREEN},
+    {"LINK",       TOKEN_LINK},
 };
 #define NUM_KEYWORDS (int)(sizeof(KEYWORDS) / sizeof(KEYWORDS[0]))
 
@@ -92,12 +135,17 @@ const char *token_type_name(VOTokenType type) {
         case TOKEN_TYPE_YN: return "TYPE_YN";
         case TOKEN_TYPE_COLL: return "TYPE_COLL";
         case TOKEN_TYPE_EMP: return "TYPE_EMP";
+        case TOKEN_TYPE_FILE: return "TYPE_FILE";
+        case TOKEN_TYPE_TASK: return "TYPE_TASK";
+        case TOKEN_TYPE_LOCK: return "TYPE_LOCK";
+        case TOKEN_TYPE_EVENT: return "TYPE_EVENT";
         case TOKEN_VAR: return "VAR";
         case TOKEN_HARD: return "HARD";
         case TOKEN_EAQ: return "EAQ";
         case TOKEN_STORE: return "STORE";
         case TOKEN_LOAD: return "LOAD";
         case TOKEN_SHOW: return "SHOW";
+        case TOKEN_TAKE: return "TAKE";
         case TOKEN_CLEAN: return "CLEAN";
         case TOKEN_CLEANALL: return "CLEANALL";
         case TOKEN_AUTOCLEAN: return "AUTOCLEAN";
@@ -141,6 +189,40 @@ const char *token_type_name(VOTokenType type) {
         case TOKEN_ENDDO: return "ENDDO";
         case TOKEN_SERVE: return "SERVE";
         case TOKEN_ISSUE: return "ISSUE";
+        case TOKEN_ATTACH: return "ATTACH";
+        case TOKEN_PLACE: return "PLACE";
+        case TOKEN_ERASE: return "ERASE";
+        case TOKEN_COUNT: return "COUNT";
+        case TOKEN_SEEK: return "SEEK";
+        case TOKEN_HAS: return "HAS";
+        case TOKEN_BIND: return "BIND";
+        case TOKEN_SEVER: return "SEVER";
+        case TOKEN_CUT: return "CUT";
+        case TOKEN_RAISE: return "RAISE";
+        case TOKEN_LOWER: return "LOWER";
+        case TOKEN_UNSEAL: return "UNSEAL";
+        case TOKEN_SEAL: return "SEAL";
+        case TOKEN_DRAW: return "DRAW";
+        case TOKEN_PUT: return "PUT";
+        case TOKEN_MOVE: return "MOVE";
+        case TOKEN_MAKE: return "MAKE";
+        case TOKEN_RECALL: return "RECALL";
+        case TOKEN_CLONE: return "CLONE";
+        case TOKEN_DELIVER: return "DELIVER";
+        case TOKEN_SPAWN: return "SPAWN";
+        case TOKEN_HOLD: return "HOLD";
+        case TOKEN_CLAIM: return "CLAIM";
+        case TOKEN_HALT: return "HALT";
+        case TOKEN_SEIZE: return "SEIZE";
+        case TOKEN_RELEASE: return "RELEASE";
+        case TOKEN_ALIGN: return "ALIGN";
+        case TOKEN_ARM: return "ARM";
+        case TOKEN_DISARM: return "DISARM";
+        case TOKEN_FIRE: return "FIRE";
+        case TOKEN_RANK: return "RANK";
+        case TOKEN_KILL: return "KILL";
+        case TOKEN_SCREEN: return "SCREEN";
+        case TOKEN_LINK: return "LINK";
         case TOKEN_PLUS: return "PLUS";
         case TOKEN_MINUS: return "MINUS";
         case TOKEN_STAR: return "STAR";
@@ -374,6 +456,8 @@ Token lexer_next_token(Lexer *lx) {
         case ')': return make_token(lx, TOKEN_RPAREN);
         case '[': return make_token(lx, TOKEN_LBRACKET);
         case ']': return make_token(lx, TOKEN_RBRACKET);
+        case '{': return make_token(lx, TOKEN_LBRACE);
+        case '}': return make_token(lx, TOKEN_RBRACE);
         case ',': return make_token(lx, TOKEN_COMMA);
         case ':': return make_token(lx, TOKEN_COLON);
         case '.': return make_token(lx, TOKEN_DOT);

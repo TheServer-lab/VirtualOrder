@@ -89,6 +89,27 @@ void ast_print(ASTNode *node, int indent) {
             ast_print(node->as.index_expr.array, indent + 1);
             ast_print(node->as.index_expr.index, indent + 1);
             break;
+        case NODE_SLICE:
+            pad(indent); printf("Slice\n");
+            ast_print(node->as.slice_expr.array, indent + 1);
+            if (node->as.slice_expr.start) ast_print(node->as.slice_expr.start, indent + 1);
+            else { pad(indent + 1); printf("(start omitted)\n"); }
+            if (node->as.slice_expr.end) ast_print(node->as.slice_expr.end, indent + 1);
+            else { pad(indent + 1); printf("(end omitted)\n"); }
+            break;
+        case NODE_TEX_INTERP:
+            pad(indent); printf("TexInterp\n");
+            for (int i = 0; i < node->as.tex_interp.parts.count; i++)
+                ast_print(node->as.tex_interp.parts.items[i], indent + 1);
+            break;
+        case NODE_INTERP_LITERAL:
+            pad(indent); printf("InterpLiteral \"%s\"\n", node->as.interp_lit.text);
+            break;
+        case NODE_COMMAND:
+            pad(indent); printf("Command kind=%d\n", node->as.command.kind);
+            for (int i = 0; i < node->as.command.args.count; i++)
+                ast_print(node->as.command.args.items[i], indent + 1);
+            break;
         case NODE_CALL:
             pad(indent); printf("Call\n");
             ast_print(node->as.call.callee, indent + 1);
@@ -128,7 +149,8 @@ void ast_print(ASTNode *node, int indent) {
 
         case NODE_SHOW_STMT:
             pad(indent); printf("ShowStmt\n");
-            ast_print(node->as.show_stmt.expr, indent + 1);
+            for (int i = 0; i < node->as.show_stmt.expr.count; i++)
+                ast_print(node->as.show_stmt.expr.items[i], indent + 1);
             break;
 
         case NODE_STORE_STMT:
@@ -314,6 +336,24 @@ void ast_free(ASTNode *node) {
             ast_free(node->as.index_expr.array);
             ast_free(node->as.index_expr.index);
             break;
+        case NODE_SLICE:
+            ast_free(node->as.slice_expr.array);
+            ast_free(node->as.slice_expr.start);
+            ast_free(node->as.slice_expr.end);
+            break;
+        case NODE_TEX_INTERP:
+            for (int i = 0; i < node->as.tex_interp.parts.count; i++)
+                ast_free(node->as.tex_interp.parts.items[i]);
+            free(node->as.tex_interp.parts.items);
+            break;
+        case NODE_INTERP_LITERAL:
+            free(node->as.interp_lit.text);
+            break;
+        case NODE_COMMAND:
+            for (int i = 0; i < node->as.command.args.count; i++)
+                ast_free(node->as.command.args.items[i]);
+            free(node->as.command.args.items);
+            break;
         case NODE_CALL:
             ast_free(node->as.call.callee);
             for (int i = 0; i < node->as.call.args.count; i++)
@@ -339,7 +379,9 @@ void ast_free(ASTNode *node) {
             ast_free(node->as.inc_dec.target);
             break;
         case NODE_SHOW_STMT:
-            ast_free(node->as.show_stmt.expr);
+            for (int i = 0; i < node->as.show_stmt.expr.count; i++)
+                ast_free(node->as.show_stmt.expr.items[i]);
+            free(node->as.show_stmt.expr.items);
             break;
         case NODE_STORE_STMT:
             ast_free(node->as.store_stmt.value);
